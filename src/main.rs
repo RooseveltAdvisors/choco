@@ -1147,6 +1147,7 @@ impl App {
                 self.status = "reloaded external changes".into();
             }
             Err(error) => {
+                self.file_marker = current;
                 self.status =
                     format!("external board unavailable - keeping current data ({error})");
             }
@@ -1550,8 +1551,8 @@ impl App {
             }
             Ok(())
         })?;
-        self.board = board;
         self.file_marker = marker(&self.path)?;
+        self.board = load_board(&self.path).unwrap_or(board);
         let selected_task_id = created_task_id.or(task_id);
         if selected_task_id.is_some() {
             self.focus = Focus::Tasks;
