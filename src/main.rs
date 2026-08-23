@@ -439,7 +439,8 @@ impl BoardLock {
         for _ in 0..50 {
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(mut file) => {
-                    let _ = writeln!(file, "{}", process::id());
+                    writeln!(file, "{}", process::id())?;
+                    file.sync_all()?;
                     return Ok(Self { path });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -469,7 +470,7 @@ fn is_stale_lock(path: &Path) -> bool {
     };
     let pid: u32 = match content.trim().parse() {
         Ok(pid) => pid,
-        Err(_) => return true,
+        Err(_) => return false,
     };
     !process_alive(pid)
 }
@@ -2554,13 +2555,18 @@ captain context\n    indented code\n\n## nested heading\n\n```text\n# heading in
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let lock_path = dir.join("test.lock");
+        // missing file is stale
         assert!(is_stale_lock(&lock_path));
+        // empty file: lock is being written, treat as NOT stale
         fs::write(&lock_path, "").unwrap();
-        assert!(is_stale_lock(&lock_path));
+        assert!(!is_stale_lock(&lock_path));
+        // garbage: lock is being written, treat as NOT stale
         fs::write(&lock_path, "garbage").unwrap();
-        assert!(is_stale_lock(&lock_path));
+        assert!(!is_stale_lock(&lock_path));
+        // valid PID of current process: NOT stale
         fs::write(&lock_path, format!("{}", process::id())).unwrap();
         assert!(!is_stale_lock(&lock_path));
+        // valid PID of non-existent process: stale
         fs::write(&lock_path, "99999999").unwrap();
         assert!(is_stale_lock(&lock_path));
         let _ = fs::remove_dir_all(&dir);
