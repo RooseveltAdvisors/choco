@@ -80,3 +80,6 @@ cargo run -- post --channel general "First task"
 ## License
 
 MIT
+
+Greptile Apps reviews pull requests using the standard `.greptile/config.json`
+status-check setting.
