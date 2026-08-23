@@ -438,8 +438,15 @@ impl BoardLock {
         let path = board_path.with_file_name(format!(".{}.lock", file_name.to_string_lossy()));
         for _ in 0..50 {
             match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(_) => return Ok(Self { path }),
+                Ok(mut file) => {
+                    let _ = writeln!(file, "{}", process::id());
+                    return Ok(Self { path });
+                }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    if is_stale_lock(&path) {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
                     thread::sleep(Duration::from_millis(10));
                 }
                 Err(error) => return Err(error.into()),
@@ -452,6 +459,36 @@ impl BoardLock {
 impl Drop for BoardLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn is_stale_lock(path: &Path) -> bool {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(_) => return true,
+    };
+    let pid: u32 = match content.trim().parse() {
+        Ok(pid) => pid,
+        Err(_) => return true,
+    };
+    !process_alive(pid)
+}
+
+fn process_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::metadata(format!("/proc/{pid}")).is_ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(true)
     }
 }
 
@@ -2509,5 +2546,23 @@ captain context\n    indented code\n\n## nested heading\n\n```text\n# heading in
         assert_eq!(app.selected_task().unwrap().title, "renamed task");
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn stale_lock_detection() {
+        let dir = std::env::temp_dir().join(format!("choco-test-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let lock_path = dir.join("test.lock");
+        assert!(is_stale_lock(&lock_path));
+        fs::write(&lock_path, "").unwrap();
+        assert!(is_stale_lock(&lock_path));
+        fs::write(&lock_path, "garbage").unwrap();
+        assert!(is_stale_lock(&lock_path));
+        fs::write(&lock_path, format!("{}", process::id())).unwrap();
+        assert!(!is_stale_lock(&lock_path));
+        fs::write(&lock_path, "99999999").unwrap();
+        assert!(is_stale_lock(&lock_path));
+        let _ = fs::remove_dir_all(&dir);
     }
 }
