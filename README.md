@@ -1,7 +1,7 @@
 # Choco
 
 Fast Rust TUI for agent tasks: channels on the left, tasks in the middle, and
-Slack-like threads on demand.
+task details on the right.
 
 ## Run
 
@@ -9,11 +9,11 @@ Slack-like threads on demand.
 cargo run -- --file choco.json
 ```
 
-Keys: `j`/`k` or arrows move, `h`/`l` or `Tab` switch panes, `Enter` opens a
-thread, `Esc` closes it, `n` launches nvim to compose a task, `r` launches
-nvim to compose a reply, `R` reloads, and `q` quits. Saving the nvim buffer
-submits the text and returns to the board; quitting nvim without writing
-discards the draft.
+Keys: `j`/`k` or arrows move, `h`/`l` or `Tab` switch panes, `Enter` edits the
+selected task, `n` launches the editor for a new task, `r` launches it for a
+reply, `R` reloads, and `q` quits. `$EDITOR` is used when set and otherwise
+nvim is launched. Writing the editor buffer submits the text and returns to
+the board; quitting without writing discards the draft.
 
 Choco watches its board file. External changes reload when the TUI is idle.
 Writes use a temporary file and atomic rename, so a watcher never sees a
