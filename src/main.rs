@@ -464,49 +464,57 @@ impl App {
         terminal: &mut DefaultTerminal,
         mode: InputMode,
     ) -> Result<(), Box<dyn Error>> {
+        let existing = std::mem::take(&mut self.input);
         self.input_mode = Some(mode);
-        self.input.clear();
         let temp_dir = editor_temp_dir()?;
         let temp_path = temp_dir.join("compose.txt");
+
+        if !existing.is_empty() {
+            fs::write(&temp_path, &existing)?;
+        }
 
         restore_terminal(terminal)?;
         let editor_result = launch_nvim(&temp_path);
         *terminal = setup_terminal()?;
 
         let content_result = read_editor_buffer(&temp_path);
-        let cleanup_result = fs::remove_dir_all(&temp_dir);
 
-        if let Err(error) = cleanup_result {
-            self.status = format!("could not clean up editor buffer - {error}");
-        }
         let editor_status = match editor_result {
             Ok(status) => status,
             Err(error) => {
+                let _ = fs::remove_dir_all(&temp_dir);
                 self.discard_input();
                 self.status = format!("could not launch nvim - {error}");
                 return Ok(());
             }
         };
         if !editor_status.success() {
+            let _ = fs::remove_dir_all(&temp_dir);
             self.discard_input();
+            self.status = "draft discarded".into();
             return Ok(());
         }
         self.input = match content_result {
             Ok(Some(content)) if !content.trim().is_empty() => content,
             Ok(None) | Ok(Some(_)) => {
+                let _ = fs::remove_dir_all(&temp_dir);
                 self.discard_input();
                 return Ok(());
             }
             Err(error) => {
+                let _ = fs::remove_dir_all(&temp_dir);
                 self.discard_input();
                 self.status = format!("could not read editor buffer - {error}");
                 return Ok(());
             }
         };
         if let Err(error) = self.submit_input() {
-            self.discard_input();
+            self.input_mode = None;
             self.status = format!("could not save draft - {error}");
+            let _ = fs::remove_dir_all(&temp_dir);
+            return Ok(());
         }
+        let _ = fs::remove_dir_all(&temp_dir);
         Ok(())
     }
 
