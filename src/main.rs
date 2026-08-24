@@ -346,6 +346,37 @@ fn restore_terminal(terminal: &mut DefaultTerminal) -> Result<(), Box<dyn Error>
     Ok(())
 }
 
+fn editor_temp_dir() -> io::Result<PathBuf> {
+    let base = env::temp_dir();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for attempt in 0..100 {
+        let path = base.join(format!("choco-compose-{}-{stamp}-{attempt}", process::id()));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not create a unique editor buffer",
+    ))
+}
+
+fn launch_nvim(path: &Path) -> io::Result<process::ExitStatus> {
+    process::Command::new("nvim").arg(path).status()
+}
+
+fn read_editor_buffer(path: &Path) -> io::Result<Option<String>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    fs::read_to_string(path).map(Some)
+}
+
 impl App {
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<(), Box<dyn Error>> {
         loop {
@@ -355,7 +386,7 @@ impl App {
                 continue;
             }
             if let Event::Key(key) = event::read()?
-                && self.handle_key(key)?
+                && self.handle_key(key, terminal)?
             {
                 break;
             }
@@ -389,10 +420,11 @@ impl App {
         Ok(())
     }
 
-    fn handle_key(&mut self, key: KeyEvent) -> Result<bool, Box<dyn Error>> {
-        if self.input_mode.is_some() {
-            return self.handle_input_key(key);
-        }
+    fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        terminal: &mut DefaultTerminal,
+    ) -> Result<bool, Box<dyn Error>> {
         if (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'))
             || key.code == KeyCode::Char('q')
         {
@@ -417,15 +449,9 @@ impl App {
                 }
             }
             KeyCode::Esc => self.view = View::Board,
-            KeyCode::Char('n') => {
-                self.input_mode = Some(InputMode::NewTask);
-                self.input.clear();
-                self.status = "new task title:".into();
-            }
+            KeyCode::Char('n') => self.compose_with_editor(terminal, InputMode::NewTask)?,
             KeyCode::Char('r') if self.selected_task().is_some() => {
-                self.input_mode = Some(InputMode::Reply);
-                self.input.clear();
-                self.status = "reply:".into();
+                self.compose_with_editor(terminal, InputMode::Reply)?
             }
             KeyCode::Char('R') => self.reload_now()?,
             _ => {}
@@ -433,30 +459,68 @@ impl App {
         Ok(false)
     }
 
-    fn handle_input_key(&mut self, key: KeyEvent) -> Result<bool, Box<dyn Error>> {
-        match key.code {
-            KeyCode::Esc => {
-                let reload_pending = self.reload_pending;
-                self.input_mode = None;
-                self.input.clear();
-                self.reload_pending = false;
-                if reload_pending {
-                    self.file_marker = None;
-                    self.status = "draft discarded; reloading external changes".into();
-                } else {
-                    self.status = "draft discarded".into();
-                }
-            }
-            KeyCode::Enter if !self.input.trim().is_empty() => self.submit_input()?,
-            KeyCode::Backspace => {
-                self.input.pop();
-            }
-            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.input.push(character);
-            }
-            _ => {}
+    fn compose_with_editor(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        mode: InputMode,
+    ) -> Result<(), Box<dyn Error>> {
+        self.input_mode = Some(mode);
+        self.input.clear();
+        let temp_dir = editor_temp_dir()?;
+        let temp_path = temp_dir.join("compose.txt");
+
+        restore_terminal(terminal)?;
+        let editor_result = launch_nvim(&temp_path);
+        *terminal = setup_terminal()?;
+
+        let content_result = read_editor_buffer(&temp_path);
+        let cleanup_result = fs::remove_dir_all(&temp_dir);
+
+        if let Err(error) = cleanup_result {
+            self.status = format!("could not clean up editor buffer - {error}");
         }
-        Ok(false)
+        let editor_status = match editor_result {
+            Ok(status) => status,
+            Err(error) => {
+                self.discard_input();
+                self.status = format!("could not launch nvim - {error}");
+                return Ok(());
+            }
+        };
+        if !editor_status.success() {
+            self.discard_input();
+            return Ok(());
+        }
+        self.input = match content_result {
+            Ok(Some(content)) if !content.trim().is_empty() => content,
+            Ok(None) | Ok(Some(_)) => {
+                self.discard_input();
+                return Ok(());
+            }
+            Err(error) => {
+                self.discard_input();
+                self.status = format!("could not read editor buffer - {error}");
+                return Ok(());
+            }
+        };
+        if let Err(error) = self.submit_input() {
+            self.discard_input();
+            self.status = format!("could not save draft - {error}");
+        }
+        Ok(())
+    }
+
+    fn discard_input(&mut self) {
+        let reload_pending = self.reload_pending;
+        self.input_mode = None;
+        self.input.clear();
+        self.reload_pending = false;
+        if reload_pending {
+            self.file_marker = None;
+            self.status = "draft discarded; reloading external changes".into();
+        } else {
+            self.status = "draft discarded".into();
+        }
     }
 
     fn submit_input(&mut self) -> Result<(), Box<dyn Error>> {
