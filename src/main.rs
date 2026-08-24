@@ -449,13 +449,27 @@ fn task_editor_buffer(task: &Task) -> String {
     buffer
 }
 
-fn parse_task_editor(content: &str) -> Result<(String, String), Box<dyn Error>> {
+fn preserved_editor_suffix(replies: &[Reply]) -> String {
+    let mut suffix = format!("\n\n{TASK_REPLIES_MARKER}");
+    for reply in replies {
+        suffix.push_str(&format!("\n\n{}:\n{}", reply.author, reply.body));
+    }
+    suffix.push('\n');
+    suffix
+}
+
+fn parse_task_editor(
+    content: &str,
+    preserved_replies: &[Reply],
+) -> Result<(String, String), Box<dyn Error>> {
     let (title, rest) = content
         .split_once('\n')
         .ok_or("task editor needs a title")?;
+    let suffix = preserved_editor_suffix(preserved_replies);
     let body = rest
-        .rsplit_once(TASK_REPLIES_MARKER)
-        .map(|(body, _)| body)
+        .strip_suffix(&suffix)
+        .or_else(|| rest.strip_suffix(suffix.trim_end_matches('\n')))
+        .or_else(|| rest.strip_suffix(&format!("\n\n{TASK_REPLIES_MARKER}")))
         .unwrap_or(rest);
     let title = title.trim().to_string();
     if title.is_empty() {
@@ -723,8 +737,15 @@ impl App {
     }
 
     fn submit_input(&mut self, mode: EditorMode, content: &str) -> Result<(), Box<dyn Error>> {
+        let preserved_replies = if mode == EditorMode::EditTask {
+            self.selected_task()
+                .map(|task| task.replies.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let (text, body) = match mode {
-            EditorMode::EditTask => parse_task_editor(content)?,
+            EditorMode::EditTask => parse_task_editor(content, &preserved_replies)?,
             EditorMode::NewTask | EditorMode::Reply => (content.trim().to_string(), String::new()),
         };
         if text.is_empty() {
@@ -1085,7 +1106,7 @@ mod tests {
             replies: vec![Reply {
                 id: "reply-1".into(),
                 author: "captain".into(),
-                body: "Thread context".into(),
+                body: format!("Thread context\n{TASK_REPLIES_MARKER}"),
             }],
         };
         let buffer = task_editor_buffer(&task);
@@ -1093,13 +1114,13 @@ mod tests {
         assert!(buffer.contains("Task context"));
         assert!(buffer.contains("captain:\nThread context"));
         assert_eq!(
-            parse_task_editor(&buffer).unwrap(),
+            parse_task_editor(&buffer, &task.replies).unwrap(),
             (task.title.clone(), task.body.clone())
         );
 
         let edited = format!("Renamed\n\nUpdated context\n\n{TASK_REPLIES_MARKER}");
         assert_eq!(
-            parse_task_editor(&edited).unwrap(),
+            parse_task_editor(&edited, &task.replies).unwrap(),
             ("Renamed".into(), "Updated context".into())
         );
     }
