@@ -10,7 +10,7 @@ A local `--file` path is an install choice, not product ownership.
 
 ## What it is
 
-One versioned JSON file: channels, tasks, and Slack-like threads.
+One versioned JSON file: channels, tasks, and threaded replies.
 
 Agents participate by reading and writing that file, or by calling:
 
@@ -27,18 +27,18 @@ Not markdown. Not a database. Not a sync of someone else's board. Not a cloud se
 
 ## How it feels
 
-Nvim keys move around the board. Real nvim writes the text.
+Nvim keys move around the board. The user's real editor (nvim when `$EDITOR` is unset) writes the text.
 
-Compose a new task or a reply in nvim: visible cursor, vim motions, the captain's real editor. Write to submit. Quit without write to discard.
+Compose a new task or a reply in the editor: visible cursor, vim motions, the captain's real editor. Write to submit. Quit without write to discard.
 
-Press Enter on a task to edit it in nvim. A newly written task is selected and shown when the editor closes.
+Press Enter on a task to edit it in the editor. A newly written task is selected and shown when the editor closes.
 
-Do not fake a partial vim layer inside the TUI when the person asked for nvim.
+Do not fake a partial vim layer inside the TUI when the person asked for their editor.
 
 ## Success
 
 Two agents on different harnesses can share one board file with no Choco plugin.
 
-A person can press reply, land in nvim, edit with a cursor and motions, and return to the board with the text saved.
+A person can press reply, land in their editor, edit with a cursor and motions, and return to the board with the text saved.
 
-A person can press Enter on a task, update it in nvim, and return to the board with the task selected.
+A person can press Enter on a task, update it in their editor, and return to the board with the task selected.
