@@ -440,7 +440,7 @@ fn read_editor_buffer(path: &Path) -> io::Result<Option<String>> {
 
 fn task_editor_buffer(task: &Task) -> String {
     let mut buffer = format!("{}\n\n{}", task.title, task.body);
-    buffer.push_str("\n\n");
+    buffer.push_str(if task.body.is_empty() { "\n" } else { "\n\n" });
     buffer.push_str(TASK_REPLIES_MARKER);
     for reply in &task.replies {
         buffer.push_str(&format!("\n\n{}:\n{}", reply.author, reply.body));
@@ -1122,6 +1122,16 @@ mod tests {
         assert_eq!(
             parse_task_editor(&edited, &task.replies).unwrap(),
             ("Renamed".into(), "Updated context".into())
+        );
+
+        let empty_body_task = Task {
+            body: String::new(),
+            ..task
+        };
+        let empty_body_buffer = task_editor_buffer(&empty_body_task);
+        assert_eq!(
+            parse_task_editor(&empty_body_buffer, &empty_body_task.replies).unwrap(),
+            (empty_body_task.title, String::new())
         );
     }
 
