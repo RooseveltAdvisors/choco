@@ -77,14 +77,9 @@ enum Focus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum View {
-    Board,
-    Thread,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InputMode {
+enum EditorMode {
     NewTask,
+    EditTask,
     Reply,
 }
 
@@ -94,11 +89,7 @@ struct App {
     channel_idx: usize,
     task_idx: usize,
     focus: Focus,
-    view: View,
-    input_mode: Option<InputMode>,
-    input: String,
     file_marker: Option<FileMarker>,
-    reload_pending: bool,
     status: String,
 }
 
@@ -320,11 +311,7 @@ fn run_tui(path: PathBuf) -> Result<(), Box<dyn Error>> {
         channel_idx: 0,
         task_idx: 0,
         focus: Focus::Tasks,
-        view: View::Board,
-        input_mode: None,
-        input: String::new(),
-        reload_pending: false,
-        status: "j/k move  Enter open  n new  r reply  q quit".into(),
+        status: "Ready".into(),
     };
     let mut terminal = setup_terminal()?;
     let result = app.run(&mut terminal);
@@ -366,8 +353,70 @@ fn editor_temp_dir() -> io::Result<PathBuf> {
     ))
 }
 
-fn launch_nvim(path: &Path) -> io::Result<process::ExitStatus> {
-    process::Command::new("nvim").arg(path).status()
+fn launch_editor(path: &Path) -> io::Result<process::ExitStatus> {
+    let command = env::var("EDITOR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "nvim".into());
+    let mut parts = split_command(&command)?;
+    let executable = parts.remove(0);
+    process::Command::new(executable)
+        .args(parts)
+        .arg(path)
+        .status()
+}
+
+fn split_command(command: &str) -> io::Result<Vec<String>> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut token_started = false;
+
+    for character in command.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            token_started = true;
+        } else if character == '\\' && quote != Some('\'') {
+            escaped = true;
+            token_started = true;
+        } else if let Some(active_quote) = quote {
+            if character == active_quote {
+                quote = None;
+            } else {
+                current.push(character);
+            }
+        } else if character == '\'' || character == '"' {
+            quote = Some(character);
+            token_started = true;
+        } else if character.is_whitespace() {
+            if token_started {
+                args.push(std::mem::take(&mut current));
+                token_started = false;
+            }
+        } else {
+            current.push(character);
+            token_started = true;
+        }
+    }
+
+    if escaped || quote.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "EDITOR has an unfinished quote or escape",
+        ));
+    }
+    if token_started {
+        args.push(current);
+    }
+    if args.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "EDITOR did not contain a command",
+        ));
+    }
+    Ok(args)
 }
 
 fn read_editor_buffer(path: &Path) -> io::Result<Option<String>> {
@@ -399,17 +448,13 @@ impl App {
         if current == self.file_marker {
             return Ok(());
         }
-        if self.input_mode.is_some() {
-            self.file_marker = current;
-            self.reload_pending = true;
-            self.status = "file changed - draft preserved; submit to merge".into();
-            return Ok(());
-        }
+        let channel_id = self.selected_channel().map(|channel| channel.id.clone());
+        let task_id = self.selected_task().map(|task| task.id.clone());
         match load_board(&self.path) {
             Ok(board) => {
                 self.file_marker = current;
                 self.board = board;
-                self.clamp_selection();
+                self.restore_selection(channel_id.as_deref(), task_id.as_deref());
                 self.status = "reloaded external changes".into();
             }
             Err(error) => {
@@ -443,15 +488,14 @@ impl App {
             }
             KeyCode::Enter => {
                 if self.focus == Focus::Tasks && self.selected_task().is_some() {
-                    self.view = View::Thread;
+                    self.compose_with_editor(terminal, EditorMode::EditTask)?;
                 } else {
                     self.focus = Focus::Tasks;
                 }
             }
-            KeyCode::Esc => self.view = View::Board,
-            KeyCode::Char('n') => self.compose_with_editor(terminal, InputMode::NewTask)?,
+            KeyCode::Char('n') => self.compose_with_editor(terminal, EditorMode::NewTask)?,
             KeyCode::Char('r') if self.selected_task().is_some() => {
-                self.compose_with_editor(terminal, InputMode::Reply)?
+                self.compose_with_editor(terminal, EditorMode::Reply)?
             }
             KeyCode::Char('R') => self.reload_now()?,
             _ => {}
@@ -462,100 +506,97 @@ impl App {
     fn compose_with_editor(
         &mut self,
         terminal: &mut DefaultTerminal,
-        mode: InputMode,
+        mode: EditorMode,
     ) -> Result<(), Box<dyn Error>> {
-        let existing = std::mem::take(&mut self.input);
-        self.input_mode = Some(mode);
+        let existing = match mode {
+            EditorMode::EditTask => self
+                .selected_task()
+                .map(|task| task.title.clone())
+                .unwrap_or_default(),
+            EditorMode::NewTask | EditorMode::Reply => String::new(),
+        };
         let temp_dir = editor_temp_dir()?;
         let temp_path = temp_dir.join("compose.txt");
 
         if !existing.is_empty() {
             fs::write(&temp_path, &existing)?;
         }
+        let before = marker(&temp_path)?;
 
         restore_terminal(terminal)?;
-        let editor_result = launch_nvim(&temp_path);
+        let editor_result = launch_editor(&temp_path);
         *terminal = setup_terminal()?;
-
-        let content_result = read_editor_buffer(&temp_path);
 
         let editor_status = match editor_result {
             Ok(status) => status,
             Err(error) => {
                 let _ = fs::remove_dir_all(&temp_dir);
-                self.discard_input();
-                self.status = format!("could not launch nvim - {error}");
+                self.status = format!("could not launch editor - {error}");
                 return Ok(());
             }
         };
         if !editor_status.success() {
             let _ = fs::remove_dir_all(&temp_dir);
-            self.discard_input();
             self.status = "draft discarded".into();
             return Ok(());
         }
-        self.input = match content_result {
-            Ok(Some(content)) if !content.trim().is_empty() => content,
-            Ok(None) | Ok(Some(_)) => {
+        if marker(&temp_path)? == before {
+            let _ = fs::remove_dir_all(&temp_dir);
+            self.status = "draft discarded - write to submit".into();
+            return Ok(());
+        }
+        let content = match read_editor_buffer(&temp_path)? {
+            Some(content) if !content.trim().is_empty() => content,
+            None | Some(_) => {
                 let _ = fs::remove_dir_all(&temp_dir);
-                self.discard_input();
-                return Ok(());
-            }
-            Err(error) => {
-                let _ = fs::remove_dir_all(&temp_dir);
-                self.discard_input();
-                self.status = format!("could not read editor buffer - {error}");
+                self.status = "draft discarded".into();
                 return Ok(());
             }
         };
-        if let Err(error) = self.submit_input() {
-            self.input_mode = None;
+        if let Err(error) = self.submit_input(mode, &content) {
             self.status = format!("could not save draft - {error}");
             let _ = fs::remove_dir_all(&temp_dir);
             return Ok(());
-        }
+        };
         let _ = fs::remove_dir_all(&temp_dir);
         Ok(())
     }
 
-    fn discard_input(&mut self) {
-        let reload_pending = self.reload_pending;
-        self.input_mode = None;
-        self.input.clear();
-        self.reload_pending = false;
-        if reload_pending {
-            self.file_marker = None;
-            self.status = "draft discarded; reloading external changes".into();
-        } else {
-            self.status = "draft discarded".into();
-        }
-    }
-
-    fn submit_input(&mut self) -> Result<(), Box<dyn Error>> {
-        let mode = self.input_mode.ok_or("no input active")?;
-        let input = self.input.trim().to_string();
+    fn submit_input(&mut self, mode: EditorMode, content: &str) -> Result<(), Box<dyn Error>> {
+        let input = content.trim().to_string();
         let channel = self
             .selected_channel()
             .map(|channel| channel.id.clone())
             .unwrap_or_else(|| "general".into());
         let task_id = self.selected_task().map(|task| task.id.clone());
-        let result = update_board(&self.path, |board| {
+        let mut created_task_id = None;
+        let board = update_board(&self.path, |board| {
             match mode {
-                InputMode::NewTask => {
+                EditorMode::NewTask => {
                     if !board.channels.iter().any(|item| item.id == channel) {
                         board.channels.push(Channel {
                             id: channel.clone(),
                             name: channel.clone(),
                         });
                     }
+                    let id = new_id();
+                    created_task_id = Some(id.clone());
                     board.tasks.push(Task {
-                        id: new_id(),
+                        id,
                         channel: channel.clone(),
                         title: input.clone(),
                         replies: Vec::new(),
                     });
                 }
-                InputMode::Reply => {
+                EditorMode::EditTask => {
+                    let task = board
+                        .tasks
+                        .iter_mut()
+                        .find(|task| Some(task.id.as_str()) == task_id.as_deref())
+                        .ok_or("selected task disappeared after external change")?;
+                    task.title = input.clone();
+                }
+                EditorMode::Reply => {
                     let task = board
                         .tasks
                         .iter_mut()
@@ -569,31 +610,28 @@ impl App {
                 }
             }
             Ok(())
-        });
-        let board = match result {
-            Ok(board) => board,
-            Err(error) => {
-                return Err(error);
-            }
-        };
+        })?;
         self.board = board;
         self.file_marker = marker(&self.path)?;
-        self.input_mode = None;
-        self.input.clear();
-        self.reload_pending = false;
-        self.clamp_selection();
-        self.status = "saved".into();
+        let selected_task_id = created_task_id.or(task_id);
+        if selected_task_id.is_some() {
+            self.focus = Focus::Tasks;
+        }
+        self.restore_selection(Some(&channel), selected_task_id.as_deref());
+        self.status = match mode {
+            EditorMode::NewTask => "Task saved - selected below".into(),
+            EditorMode::EditTask => "Task updated".into(),
+            EditorMode::Reply => "Reply saved".into(),
+        };
         Ok(())
     }
 
     fn reload_now(&mut self) -> Result<(), Box<dyn Error>> {
-        if self.input_mode.is_some() {
-            self.status = "finish or Esc the draft before reloading".into();
-            return Ok(());
-        }
+        let channel_id = self.selected_channel().map(|channel| channel.id.clone());
+        let task_id = self.selected_task().map(|task| task.id.clone());
         self.board = load_board(&self.path)?;
         self.file_marker = marker(&self.path)?;
-        self.clamp_selection();
+        self.restore_selection(channel_id.as_deref(), task_id.as_deref());
         self.status = "reloaded".into();
         Ok(())
     }
@@ -637,87 +675,124 @@ impl App {
             .min(self.visible_tasks().len().saturating_sub(1));
     }
 
+    fn restore_selection(&mut self, channel_id: Option<&str>, task_id: Option<&str>) {
+        let task_channel = task_id.and_then(|id| {
+            self.board
+                .tasks
+                .iter()
+                .find(|task| task.id == id)
+                .map(|task| task.channel.as_str())
+        });
+        if let Some(id) = task_channel.or(channel_id)
+            && let Some(index) = self
+                .board
+                .channels
+                .iter()
+                .position(|channel| channel.id == id)
+        {
+            self.channel_idx = index;
+        }
+        if let Some(id) = task_id
+            && let Some(index) = self.visible_tasks().iter().position(|task| task.id == id)
+        {
+            self.task_idx = index;
+            return;
+        }
+        self.clamp_selection();
+    }
+
     fn draw(&self, frame: &mut Frame) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),
+                Constraint::Length(4),
                 Constraint::Min(1),
                 Constraint::Length(2),
             ])
             .split(frame.area());
-        let title = Paragraph::new(Line::from(vec![
-            Span::styled(
-                " choco ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("task board"),
+        let title = Paragraph::new(Text::from(vec![
+            Line::from(vec![
+                Span::styled(
+                    " choco ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("task board", Style::default().add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(Span::styled(
+                " j/k move   h/l panes   Enter edit   n new task   r reply   q quit",
+                Style::default().fg(Color::Cyan),
+            )),
         ]))
         .block(Block::default().borders(Borders::BOTTOM));
         frame.render_widget(title, chunks[0]);
-        match self.view {
-            View::Board => self.draw_board(frame, chunks[1]),
-            View::Thread => self.draw_thread(frame, chunks[1]),
-        }
-        let status = if let Some(mode) = self.input_mode {
-            let label = match mode {
-                InputMode::NewTask => "new task",
-                InputMode::Reply => "reply",
-            };
-            Paragraph::new(format!(" {label}> {}", self.input))
-                .style(Style::default().fg(Color::Cyan))
-        } else {
-            Paragraph::new(format!(" {}", self.status))
-        };
+        self.draw_board(frame, chunks[1]);
+        let status =
+            Paragraph::new(format!(" {} ", self.status)).style(Style::default().fg(Color::Green));
         frame.render_widget(status, chunks[2]);
     }
 
     fn draw_board(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(25), Constraint::Percentage(75)])
-            .split(area);
-        self.draw_channels(frame, columns[0]);
-        self.draw_tasks(frame, columns[1]);
-    }
-
-    fn draw_thread(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Percentage(20),
-                Constraint::Percentage(30),
-                Constraint::Percentage(50),
+                Constraint::Percentage(35),
+                Constraint::Percentage(45),
             ])
             .split(area);
         self.draw_channels(frame, columns[0]);
         self.draw_tasks(frame, columns[1]);
+        self.draw_details(frame, columns[2]);
+    }
+
+    fn draw_details(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
         let lines = if let Some(task) = self.selected_task() {
-            let mut lines = vec![Line::from(Span::styled(
-                &task.title,
-                Style::default().add_modifier(Modifier::BOLD),
-            ))];
-            lines.extend(task.replies.iter().flat_map(|reply| {
-                [
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    task.title.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(format!("id: {}", task.id)),
+                Line::from(format!("replies: {}", task.replies.len())),
+            ];
+            for reply in &task.replies {
+                lines.extend([
                     Line::from(""),
                     Line::from(Span::styled(
                         format!("{}:", reply.author),
                         Style::default().fg(Color::Cyan),
                     )),
                     Line::from(reply.body.clone()),
-                ]
-            }));
+                ]);
+            }
             lines
         } else {
-            vec![Line::from("No task selected")]
+            vec![
+                Line::from(Span::styled(
+                    "No task selected",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from("Press n to create a task."),
+            ]
         };
         frame.render_widget(
             Paragraph::new(Text::from(lines))
-                .block(Block::default().title(" thread ").borders(Borders::ALL))
+                .block(
+                    Block::default()
+                        .title(" Task details ")
+                        .borders(Borders::ALL)
+                        .border_style(if self.focus == Focus::Tasks {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            Style::default()
+                        }),
+                )
                 .wrap(Wrap { trim: true }),
-            columns[2],
+            area,
         );
     }
 
@@ -740,7 +815,14 @@ impl App {
                 }
             })
             .collect::<Vec<_>>();
-        let block = Block::default().title(" channels ").borders(Borders::ALL);
+        let block = Block::default()
+            .title(" Channels  [h/l] ")
+            .borders(Borders::ALL)
+            .border_style(if self.focus == Focus::Channels {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            });
         frame.render_widget(List::new(items).block(block), area);
     }
 
@@ -750,7 +832,16 @@ impl App {
             .iter()
             .enumerate()
             .map(|(index, task)| {
-                let item = ListItem::new(format!("{}  {}", task.id, task.title));
+                let marker = if index == self.task_idx && self.focus == Focus::Tasks {
+                    "›"
+                } else {
+                    " "
+                };
+                let item = ListItem::new(format!(
+                    "{marker} {}  ({} replies)",
+                    task.title,
+                    task.replies.len()
+                ));
                 if index == self.task_idx && self.focus == Focus::Tasks {
                     item.style(
                         Style::default()
@@ -764,17 +855,17 @@ impl App {
             .collect::<Vec<_>>();
         let block = Block::default()
             .title(format!(
-                " #{} tasks - {} ",
+                " #{} Tasks  [Enter edit] ",
                 self.selected_channel()
                     .map(|item| item.name.as_str())
                     .unwrap_or("?"),
-                if self.view == View::Board {
-                    "Enter opens thread"
-                } else {
-                    "Esc closes thread"
-                }
             ))
-            .borders(Borders::ALL);
+            .borders(Borders::ALL)
+            .border_style(if self.focus == Focus::Tasks {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            });
         frame.render_widget(List::new(items).block(block), area);
     }
 }
@@ -798,9 +889,48 @@ mod tests {
     }
 
     #[test]
+    fn editor_command_supports_quoted_arguments() {
+        assert_eq!(
+            split_command("nvim -c 'set number'").unwrap(),
+            ["nvim", "-c", "set number"]
+        );
+        assert!(split_command("nvim 'unfinished").is_err());
+    }
+
+    #[test]
     fn default_board_has_a_channel() {
         let board = Board::default();
         assert_eq!(board.version, 1);
         assert_eq!(board.channels[0].id, "general");
+    }
+
+    #[test]
+    fn editor_submission_selects_new_task_and_updates_existing_task() {
+        let path = env::temp_dir().join(format!("choco-test-{}-{}.json", process::id(), new_id()));
+        let mut app = App {
+            path: path.clone(),
+            board: Board::default(),
+            channel_idx: 0,
+            task_idx: 0,
+            focus: Focus::Tasks,
+            file_marker: None,
+            status: String::new(),
+        };
+
+        app.submit_input(EditorMode::NewTask, "first task").unwrap();
+        assert_eq!(app.selected_task().unwrap().title, "first task");
+
+        app.submit_input(EditorMode::NewTask, "second task")
+            .unwrap();
+        let mut external = load_board(&path).unwrap();
+        external.tasks.reverse();
+        write_board(&path, &external).unwrap();
+
+        app.submit_input(EditorMode::EditTask, "renamed task")
+            .unwrap();
+        assert_eq!(app.selected_task().unwrap().title, "renamed task");
+        assert_eq!(app.task_idx, 0);
+
+        let _ = fs::remove_file(path);
     }
 }
