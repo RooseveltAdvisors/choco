@@ -565,8 +565,7 @@ impl App {
         let board = match result {
             Ok(board) => board,
             Err(error) => {
-                self.status = format!("could not save draft - {error}");
-                return Ok(());
+                return Err(error);
             }
         };
         self.board = board;
