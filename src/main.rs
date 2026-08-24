@@ -26,6 +26,7 @@ use ratatui::{
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_FILE: &str = "choco.json";
+const TASK_REPLIES_MARKER: &str = "--- Replies (preserved on save) ---";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,10 +53,12 @@ struct Task {
     channel: String,
     title: String,
     #[serde(default)]
+    body: String,
+    #[serde(default)]
     replies: Vec<Reply>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Reply {
     id: String,
@@ -91,6 +94,10 @@ struct App {
     focus: Focus,
     file_marker: Option<FileMarker>,
     status: String,
+    detail_scroll: u16,
+    search_query: Option<String>,
+    search_input: Option<String>,
+    pending_g: bool,
 }
 
 impl Default for Board {
@@ -262,6 +269,7 @@ fn post_task(path: &Path, channel: &str, title: &str) -> Result<(), Box<dyn Erro
             id: new_id(),
             channel: channel.into(),
             title: title.into(),
+            body: String::new(),
             replies: Vec::new(),
         });
         Ok(())
@@ -312,6 +320,10 @@ fn run_tui(path: PathBuf) -> Result<(), Box<dyn Error>> {
         task_idx: 0,
         focus: Focus::Tasks,
         status: "Ready".into(),
+        detail_scroll: 0,
+        search_query: None,
+        search_input: None,
+        pending_g: false,
     };
     let mut terminal = setup_terminal()?;
     let result = app.run(&mut terminal);
@@ -426,6 +438,42 @@ fn read_editor_buffer(path: &Path) -> io::Result<Option<String>> {
     fs::read_to_string(path).map(Some)
 }
 
+fn task_editor_buffer(task: &Task) -> String {
+    let mut buffer = format!("{}\n\n{}", task.title, task.body);
+    buffer.push_str("\n\n");
+    buffer.push_str(TASK_REPLIES_MARKER);
+    for reply in &task.replies {
+        buffer.push_str(&format!("\n\n{}:\n{}", reply.author, reply.body));
+    }
+    buffer.push('\n');
+    buffer
+}
+
+fn parse_task_editor(content: &str) -> Result<(String, String), Box<dyn Error>> {
+    let (title, rest) = content
+        .split_once('\n')
+        .ok_or("task editor needs a title")?;
+    let body = rest
+        .rsplit_once(TASK_REPLIES_MARKER)
+        .map(|(body, _)| body)
+        .unwrap_or(rest);
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return Err("task title cannot be empty".into());
+    }
+    Ok((title, body.trim().to_string()))
+}
+
+fn task_matches(task: &Task, query: &str) -> bool {
+    let query = query.to_lowercase();
+    task.title.to_lowercase().contains(&query)
+        || task.body.to_lowercase().contains(&query)
+        || task.replies.iter().any(|reply| {
+            reply.author.to_lowercase().contains(&query)
+                || reply.body.to_lowercase().contains(&query)
+        })
+}
+
 impl App {
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<(), Box<dyn Error>> {
         loop {
@@ -470,16 +518,48 @@ impl App {
         key: KeyEvent,
         terminal: &mut DefaultTerminal,
     ) -> Result<bool, Box<dyn Error>> {
+        if self.search_input.is_some() {
+            self.handle_search_key(key);
+            return Ok(false);
+        }
         if (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'))
             || key.code == KeyCode::Char('q')
         {
             return Ok(true);
+        }
+        if self.pending_g {
+            self.pending_g = false;
+            if key.code == KeyCode::Char('g') {
+                self.jump_to_boundary(false);
+                return Ok(false);
+            }
         }
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             KeyCode::Char('h') | KeyCode::Left => self.focus = Focus::Channels,
             KeyCode::Char('l') | KeyCode::Right => self.focus = Focus::Tasks,
+            KeyCode::Char('g') => self.pending_g = true,
+            KeyCode::Char('G') => self.jump_to_boundary(true),
+            KeyCode::Char('/') => {
+                self.search_input = Some(String::new());
+                self.status = "/".into();
+            }
+            KeyCode::Char('n') if self.search_query.is_some() => self.find_match(1),
+            KeyCode::Char('N') if self.search_query.is_some() => self.find_match(-1),
+            KeyCode::Esc => {
+                self.pending_g = false;
+                self.search_query = None;
+                self.status = "Ready".into();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(10);
+                self.status = format!("details scrolled to {}", self.detail_scroll);
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.detail_scroll = self.detail_scroll.saturating_add(10);
+                self.status = format!("details scrolled to {}", self.detail_scroll);
+            }
             KeyCode::Tab => {
                 self.focus = match self.focus {
                     Focus::Channels => Focus::Tasks,
@@ -503,6 +583,86 @@ impl App {
         Ok(false)
     }
 
+    fn handle_search_key(&mut self, key: KeyEvent) {
+        let Some(input) = self.search_input.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.search_input = None;
+                self.status = "search cancelled".into();
+            }
+            KeyCode::Enter => {
+                let query = input.trim().to_string();
+                self.search_input = None;
+                if query.is_empty() {
+                    self.search_query = None;
+                    self.status = "search cleared".into();
+                } else {
+                    self.search_query = Some(query);
+                    self.find_match(1);
+                }
+            }
+            KeyCode::Backspace => {
+                input.pop();
+                self.status = format!("/{}", input);
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                input.push(character);
+                self.status = format!("/{}", input);
+            }
+            _ => {}
+        }
+    }
+
+    fn find_match(&mut self, delta: isize) {
+        let Some(query) = self.search_query.as_deref() else {
+            return;
+        };
+        let query = query.to_lowercase();
+        let tasks = self.visible_tasks();
+        if tasks.is_empty() {
+            self.status = format!("no matches for {}", query);
+            return;
+        }
+        for step in 1..=tasks.len() {
+            let index = (self.task_idx as isize + delta * step as isize)
+                .rem_euclid(tasks.len() as isize) as usize;
+            if task_matches(tasks[index], &query) {
+                self.task_idx = index;
+                self.focus = Focus::Tasks;
+                self.detail_scroll = 0;
+                self.status = format!("/{query}");
+                return;
+            }
+        }
+        self.status = format!("no matches for {query}");
+    }
+
+    fn jump_to_boundary(&mut self, last: bool) {
+        match self.focus {
+            Focus::Channels => {
+                self.channel_idx = if last {
+                    self.board.channels.len().saturating_sub(1)
+                } else {
+                    0
+                };
+            }
+            Focus::Tasks => {
+                self.task_idx = if last {
+                    self.visible_tasks().len().saturating_sub(1)
+                } else {
+                    0
+                };
+            }
+        }
+        self.detail_scroll = 0;
+    }
+
     fn compose_with_editor(
         &mut self,
         terminal: &mut DefaultTerminal,
@@ -511,7 +671,7 @@ impl App {
         let existing = match mode {
             EditorMode::EditTask => self
                 .selected_task()
-                .map(|task| task.title.clone())
+                .map(task_editor_buffer)
                 .unwrap_or_default(),
             EditorMode::NewTask | EditorMode::Reply => String::new(),
         };
@@ -563,7 +723,13 @@ impl App {
     }
 
     fn submit_input(&mut self, mode: EditorMode, content: &str) -> Result<(), Box<dyn Error>> {
-        let input = content.trim().to_string();
+        let (text, body) = match mode {
+            EditorMode::EditTask => parse_task_editor(content)?,
+            EditorMode::NewTask | EditorMode::Reply => (content.trim().to_string(), String::new()),
+        };
+        if text.is_empty() {
+            return Err("editor content cannot be empty".into());
+        }
         let channel = self
             .selected_channel()
             .map(|channel| channel.id.clone())
@@ -584,7 +750,8 @@ impl App {
                     board.tasks.push(Task {
                         id,
                         channel: channel.clone(),
-                        title: input.clone(),
+                        title: text.clone(),
+                        body: String::new(),
                         replies: Vec::new(),
                     });
                 }
@@ -594,7 +761,8 @@ impl App {
                         .iter_mut()
                         .find(|task| Some(task.id.as_str()) == task_id.as_deref())
                         .ok_or("selected task disappeared after external change")?;
-                    task.title = input.clone();
+                    task.title = text.clone();
+                    task.body = body.clone();
                 }
                 EditorMode::Reply => {
                     let task = board
@@ -605,7 +773,7 @@ impl App {
                     task.replies.push(Reply {
                         id: new_id(),
                         author: author(),
-                        body: input.clone(),
+                        body: text.clone(),
                     });
                 }
             }
@@ -637,6 +805,7 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
+        self.detail_scroll = 0;
         match self.focus {
             Focus::Channels => {
                 self.channel_idx = move_index(self.channel_idx, self.board.channels.len(), delta);
@@ -721,7 +890,11 @@ impl App {
                 Span::styled("task board", Style::default().add_modifier(Modifier::BOLD)),
             ]),
             Line::from(Span::styled(
-                " j/k move   h/l panes   Enter edit   n new task   r reply   q quit",
+                if let Some(query) = &self.search_input {
+                    format!(" /{query}  Enter search   Esc cancel")
+                } else {
+                    " hjkl move   gg/G top/bottom   / search   n/N next   Ctrl-u/d scroll   Enter edit   n new task   r reply   q quit".into()
+                },
                 Style::default().fg(Color::Cyan),
             )),
         ]))
@@ -758,6 +931,10 @@ impl App {
                 Line::from(format!("id: {}", task.id)),
                 Line::from(format!("replies: {}", task.replies.len())),
             ];
+            if !task.body.is_empty() {
+                lines.push(Line::from(""));
+                lines.extend(task.body.lines().map(Line::from));
+            }
             for reply in &task.replies {
                 lines.extend([
                     Line::from(""),
@@ -791,7 +968,8 @@ impl App {
                             Style::default()
                         }),
                 )
-                .wrap(Wrap { trim: true }),
+                .wrap(Wrap { trim: true })
+                .scroll((self.detail_scroll, 0)),
             area,
         );
     }
@@ -898,6 +1076,54 @@ mod tests {
     }
 
     #[test]
+    fn task_editor_buffer_includes_body_and_preserves_replies() {
+        let task = Task {
+            id: "task-1".into(),
+            channel: "general".into(),
+            title: "A task".into(),
+            body: format!("Task context\n{TASK_REPLIES_MARKER}"),
+            replies: vec![Reply {
+                id: "reply-1".into(),
+                author: "captain".into(),
+                body: "Thread context".into(),
+            }],
+        };
+        let buffer = task_editor_buffer(&task);
+        assert!(buffer.contains("A task"));
+        assert!(buffer.contains("Task context"));
+        assert!(buffer.contains("captain:\nThread context"));
+        assert_eq!(
+            parse_task_editor(&buffer).unwrap(),
+            (task.title.clone(), task.body.clone())
+        );
+
+        let edited = format!("Renamed\n\nUpdated context\n\n{TASK_REPLIES_MARKER}");
+        assert_eq!(
+            parse_task_editor(&edited).unwrap(),
+            ("Renamed".into(), "Updated context".into())
+        );
+    }
+
+    #[test]
+    fn search_matches_titles_bodies_and_replies() {
+        let task = Task {
+            id: "task-1".into(),
+            channel: "general".into(),
+            title: "A task".into(),
+            body: "Important context".into(),
+            replies: vec![Reply {
+                id: "reply-1".into(),
+                author: "captain".into(),
+                body: "Thread context".into(),
+            }],
+        };
+        assert!(task_matches(&task, "important"));
+        assert!(task_matches(&task, "thread"));
+        assert!(task_matches(&task, "CAPTAIN"));
+        assert!(!task_matches(&task, "missing"));
+    }
+
+    #[test]
     fn default_board_has_a_channel() {
         let board = Board::default();
         assert_eq!(board.version, 1);
@@ -915,6 +1141,10 @@ mod tests {
             focus: Focus::Tasks,
             file_marker: None,
             status: String::new(),
+            detail_scroll: 0,
+            search_query: None,
+            search_input: None,
+            pending_g: false,
         };
 
         app.submit_input(EditorMode::NewTask, "first task").unwrap();
@@ -922,13 +1152,22 @@ mod tests {
 
         app.submit_input(EditorMode::NewTask, "second task")
             .unwrap();
+        app.submit_input(EditorMode::Reply, "existing reply")
+            .unwrap();
+        let replies = app.selected_task().unwrap().replies.clone();
         let mut external = load_board(&path).unwrap();
         external.tasks.reverse();
         write_board(&path, &external).unwrap();
 
-        app.submit_input(EditorMode::EditTask, "renamed task")
-            .unwrap();
+        app.submit_input(
+            EditorMode::EditTask,
+            &format!("renamed task\n\nupdated body\n\n{TASK_REPLIES_MARKER}"),
+        )
+        .unwrap();
         assert_eq!(app.selected_task().unwrap().title, "renamed task");
+        assert_eq!(app.selected_task().unwrap().body, "updated body");
+        assert_eq!(app.selected_task().unwrap().replies, replies);
+        assert_eq!(load_board(&path).unwrap().tasks[0].replies, replies);
         assert_eq!(app.task_idx, 0);
 
         let _ = fs::remove_file(path);

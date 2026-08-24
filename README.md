@@ -9,11 +9,19 @@ task details on the right.
 cargo run -- --file choco.json
 ```
 
-Keys: `j`/`k` or arrows move, `h`/`l` or `Tab` switch panes, `Enter` edits the
-selected task, `n` launches the editor for a new task, `r` launches it for a
-reply, `R` reloads, and `q` quits. `$EDITOR` is used when set and otherwise
-nvim is launched. Writing the editor buffer submits the text and returns to
-the board; quitting without writing discards the draft.
+Keys follow familiar vim muscle memory: `h`/`j`/`k`/`l` move and switch panes,
+`gg`/`G` jump to the first/last item in the focused pane, `/` searches, and
+`n`/`N` cycle matches.
+`Ctrl-u`/`Ctrl-d` scroll task details, `Enter` edits the selected task, `Esc`
+cancels search, and `q` quits. Outside an active search, `n` still launches the
+editor for a new task and `r` launches it for a reply; `R` reloads.
+The configured `$EDITOR` is used when set; otherwise nvim is launched. Writing
+the editor buffer submits the text and returns to the board; quitting without
+writing discards the draft.
+
+Editing a task opens the editor with its title, body, and a preserved replies
+section. Edit the title and body above the `--- Replies (preserved on save) ---`
+marker; replies remain in the JSON thread when the task is saved.
 
 Choco watches its board file. External changes reload when the TUI is idle.
 Writes use a temporary file and atomic rename, so a watcher never sees a
@@ -34,8 +42,9 @@ for replies and defaults to `$USER`. Choco serializes writers with a small
 lock file and rejects unsupported versions or unknown fields instead of
 silently dropping data.
 
-The file format is versioned and contains `channels`, `tasks`, and each task's
-`replies`. A minimal board is:
+The file format is versioned and contains `channels`, `tasks`, each task's
+`title`, `body`, and `replies`. The `body` field may be omitted when loading
+older boards and defaults to empty. A minimal board is:
 
 ```json
 {"version":1,"channels":[{"id":"general","name":"general"}],"tasks":[]}
