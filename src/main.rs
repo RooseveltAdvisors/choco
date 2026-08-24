@@ -465,12 +465,14 @@ fn parse_task_editor(
     let (title, rest) = content
         .split_once('\n')
         .ok_or("task editor needs a title")?;
+    let normalized_rest = rest.trim_end_matches('\n');
     let suffix = preserved_editor_suffix(preserved_replies);
-    let body = rest
-        .strip_suffix(&suffix)
-        .or_else(|| rest.strip_suffix(suffix.trim_end_matches('\n')))
-        .or_else(|| rest.strip_suffix(&format!("\n\n{TASK_REPLIES_MARKER}")))
-        .unwrap_or(rest);
+    let body = normalized_rest
+        .strip_suffix(suffix.trim_end_matches('\n'))
+        .or_else(|| {
+            normalized_rest.strip_suffix(&format!("\n\n{TASK_REPLIES_MARKER}"))
+        })
+        .unwrap_or(normalized_rest);
     let title = title.trim().to_string();
     if title.is_empty() {
         return Err("task title cannot be empty".into());
@@ -1121,6 +1123,11 @@ mod tests {
         let edited = format!("Renamed\n\nUpdated context\n\n{TASK_REPLIES_MARKER}");
         assert_eq!(
             parse_task_editor(&edited, &task.replies).unwrap(),
+            ("Renamed".into(), "Updated context".into())
+        );
+        let edited_by_nvim = format!("Renamed\n\nUpdated context\n\n{TASK_REPLIES_MARKER}\n\n");
+        assert_eq!(
+            parse_task_editor(&edited_by_nvim, &task.replies).unwrap(),
             ("Renamed".into(), "Updated context".into())
         );
 
