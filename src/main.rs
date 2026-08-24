@@ -469,9 +469,7 @@ fn parse_task_editor(
     let suffix = preserved_editor_suffix(preserved_replies);
     let body = normalized_rest
         .strip_suffix(suffix.trim_end_matches('\n'))
-        .or_else(|| {
-            normalized_rest.strip_suffix(&format!("\n\n{TASK_REPLIES_MARKER}"))
-        })
+        .or_else(|| normalized_rest.strip_suffix(&format!("\n\n{TASK_REPLIES_MARKER}")))
         .unwrap_or(normalized_rest);
     let title = title.trim().to_string();
     if title.is_empty() {
