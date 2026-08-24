@@ -10,13 +10,14 @@ cargo run -- --file choco.json
 ```
 
 Keys: `j`/`k` or arrows move, `h`/`l` or `Tab` switch panes, `Enter` opens a
-thread, `Esc` closes it, `n` creates a task, `r` replies, `R` reloads, and `q`
-quits.
+thread, `Esc` closes it, `n` launches nvim to compose a task, `r` launches
+nvim to compose a reply, `R` reloads, and `q` quits. Saving the nvim buffer
+submits the text and returns to the board; quitting nvim without writing
+discards the draft.
 
-Choco watches its board file. External changes reload when the TUI is idle. If
-the file changes while a task or reply draft is open, the draft stays on
-screen; submitting it merges into the latest file contents. Writes use a
-temporary file and atomic rename, so a watcher never sees a partial board.
+Choco watches its board file. External changes reload when the TUI is idle.
+Writes use a temporary file and atomic rename, so a watcher never sees a
+partial board.
 
 ## Harness interface
 
