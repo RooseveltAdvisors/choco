@@ -1751,6 +1751,66 @@ mod tests {
     }
 
     #[test]
+    fn markdown_render_preserves_canonical_store_order_and_content() {
+        let stem = format!("choco-render-test-{}-{}", process::id(), new_id());
+        let board_path = env::temp_dir().join(format!("{stem}.json"));
+        let markdown_path = env::temp_dir().join(format!("{stem}.md"));
+        let board = Board {
+            tasks: vec![
+                Task {
+                    id: "newest".into(),
+                    channel: "general".into(),
+                    title: "Current newest".into(),
+                    body: "Newest context".into(),
+                    replies: Vec::new(),
+                },
+                Task {
+                    id: "middle".into(),
+                    channel: "general".into(),
+                    title: "Current middle".into(),
+                    body: "Middle context".into(),
+                    replies: Vec::new(),
+                },
+                Task {
+                    id: "oldest".into(),
+                    channel: "general".into(),
+                    title: "Current oldest".into(),
+                    body: "Oldest context".into(),
+                    replies: Vec::new(),
+                },
+            ],
+            ..Board::default()
+        };
+        write_board(&board_path, &board).unwrap();
+        let before = fs::read(&board_path).unwrap();
+
+        render_markdown(&board_path, &markdown_path).unwrap();
+
+        let rendered = fs::read_to_string(&markdown_path).unwrap();
+        let titles = rendered
+            .lines()
+            .filter(|line| line.starts_with("# "))
+            .map(|line| line[2..].to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            titles,
+            ["Current newest", "Current middle", "Current oldest"]
+        );
+        for (title, id, body) in [
+            ("Current newest", "newest", "Newest context"),
+            ("Current middle", "middle", "Middle context"),
+            ("Current oldest", "oldest", "Oldest context"),
+        ] {
+            let card = format!("# {title}\n\n<!-- choco: channel=general id={id} -->\n\n{body}\n");
+            assert!(rendered.contains(&card), "{card}\n{rendered}");
+        }
+        assert_eq!(fs::read(&board_path).unwrap(), before);
+
+        let _ = fs::remove_file(board_path);
+        let _ = fs::remove_file(markdown_path);
+    }
+
+    #[test]
     fn markdown_render_imports_stamps_and_migrates_legacy_task_order() {
         let stem = format!("choco-render-test-{}-{}", process::id(), new_id());
         let board_path = env::temp_dir().join(format!("{stem}.json"));
