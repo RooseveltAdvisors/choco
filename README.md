@@ -10,8 +10,9 @@ cargo run -- --file choco.json
 ```
 
 Keys follow familiar vim muscle memory: `h`/`j`/`k`/`l` move and switch panes,
-`gg`/`G` jump to the first/last item in the focused pane, `/` searches, and
-`n`/`N` cycle matches.
+`gg`/`G` jump to the first/last item in the focused pane, and `/` opens a live,
+Flash-style search. Type to filter candidates, press `Enter`, then press a
+candidate's letter to jump to it. `n`/`N` cycle matches afterward.
 `Ctrl-u`/`Ctrl-d` scroll task details, `Enter` edits the selected task, `Esc`
 cancels search, and `q` quits. Outside an active search, `n` still launches the
 editor for a new task and `r` launches it for a reply; `R` reloads.
