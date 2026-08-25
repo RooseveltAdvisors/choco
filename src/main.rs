@@ -1574,6 +1574,132 @@ mod tests {
         app.search_selecting = true;
         app.handle_search_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.search_query.is_none());
+        assert!(app.search_input.is_none());
+        assert!(!app.search_selecting);
+    }
+
+    fn search_test_app(tasks: Vec<Task>) -> App {
+        App {
+            path: PathBuf::new(),
+            board: Board {
+                tasks,
+                ..Board::default()
+            },
+            channel_idx: 0,
+            task_idx: 0,
+            focus: Focus::Tasks,
+            file_marker: None,
+            status: String::new(),
+            detail_scroll: 0,
+            search_query: None,
+            search_input: None,
+            search_selecting: false,
+            pending_g: false,
+        }
+    }
+
+    fn press_search(app: &mut App, code: KeyCode) {
+        app.handle_search_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn render_screen(app: &App) -> String {
+        render_screen_sized(app, 120, 20)
+    }
+
+    fn render_screen_sized(app: &App, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        format!("{}", terminal.backend())
+    }
+
+    #[test]
+    fn slash_search_caps_labels_at_26_and_indicates_total() {
+        let tasks = (0..30)
+            .map(|i| Task {
+                id: format!("t{i}"),
+                channel: "general".into(),
+                title: format!("Task {i:02}"),
+                body: String::new(),
+                replies: Vec::new(),
+            })
+            .collect();
+        let mut app = search_test_app(tasks);
+        app.search_input = Some(String::new());
+        press_search(&mut app, KeyCode::Char('t'));
+
+        assert_eq!(app.search_candidates().len(), 26);
+        assert_eq!(app.search_match_count(), 30);
+        assert!(app.status.contains("26 of 30"));
+        assert!(app.status.contains("type to narrow, Enter labels"));
+        assert_eq!(app.search_label_target('a'), Some(0));
+        assert_eq!(app.search_label_target('m'), Some(25));
+        assert!(app.search_label_target('1').is_none());
+
+        let screen = render_screen_sized(&app, 120, 40);
+        assert!(screen.contains("a › Task 00"), "{screen}");
+        assert!(screen.contains("m   Task 25"), "{screen}");
+        assert!(!screen.contains("Task 26"), "{screen}");
+        assert!(!screen.contains("Task 29"), "{screen}");
+        assert!(screen.contains("26 of 30"), "{screen}");
+
+        press_search(&mut app, KeyCode::Enter);
+        assert!(app.search_selecting);
+        assert!(app.status.contains("press a letter to jump"));
+        let labeled = render_screen(&app);
+        assert!(labeled.contains("press a letter to jump"), "{labeled}");
+
+        press_search(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.selected_task().unwrap().id, "t1");
+        assert!(app.search_input.is_none());
+        assert_eq!(app.search_query.as_deref(), Some("t"));
+        assert!(app.status.contains("[s] selected"));
+
+        app.find_match(1);
+        assert_eq!(app.selected_task().unwrap().id, "t2");
+        app.find_match(-1);
+        assert_eq!(app.selected_task().unwrap().id, "t1");
+    }
+
+    #[test]
+    fn slash_search_renders_live_labels_before_enter() {
+        let mut app = search_test_app(vec![
+            Task {
+                id: "alpha".into(),
+                channel: "general".into(),
+                title: "Alpha task".into(),
+                body: String::new(),
+                replies: Vec::new(),
+            },
+            Task {
+                id: "beta".into(),
+                channel: "general".into(),
+                title: "Beta task".into(),
+                body: String::new(),
+                replies: Vec::new(),
+            },
+            Task {
+                id: "alphabet".into(),
+                channel: "general".into(),
+                title: "Alphabet task".into(),
+                body: String::new(),
+                replies: Vec::new(),
+            },
+        ]);
+        app.search_input = Some(String::new());
+        press_search(&mut app, KeyCode::Char('a'));
+        press_search(&mut app, KeyCode::Char('l'));
+
+        let screen = render_screen(&app);
+        assert!(screen.contains("/al"), "{screen}");
+        assert!(screen.contains("type to narrow"), "{screen}");
+        assert!(screen.contains("Enter labels"), "{screen}");
+        assert!(screen.contains("a "), "{screen}");
+        assert!(screen.contains("s "), "{screen}");
+        assert!(screen.contains("Alpha task"), "{screen}");
+        assert!(screen.contains("Alphabet task"), "{screen}");
+        assert!(!screen.contains("Beta task"), "{screen}");
+        assert!(app.status.contains("2 candidates"), "{}", app.status);
     }
 
     #[test]
