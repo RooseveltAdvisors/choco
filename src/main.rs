@@ -40,6 +40,14 @@ struct Board {
     channels: Vec<Channel>,
     #[serde(default)]
     tasks: Vec<Task>,
+    #[serde(default)]
+    task_order: Option<TaskOrder>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TaskOrder {
+    NewestFirst,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +120,7 @@ impl Default for Board {
                 name: "general".into(),
             }],
             tasks: Vec::new(),
+            task_order: Some(TaskOrder::NewestFirst),
         }
     }
 }
@@ -197,9 +206,13 @@ fn load_board(path: &Path) -> Result<Board, Box<dyn Error>> {
     if !path.exists() {
         return Ok(Board::default());
     }
-    let board: Board = serde_json::from_reader(File::open(path)?)?;
+    let mut board: Board = serde_json::from_reader(File::open(path)?)?;
     if board.version != 1 {
         return Err(format!("unsupported board version: {}", board.version).into());
+    }
+    if board.task_order.is_none() {
+        board.tasks.reverse();
+        board.task_order = Some(TaskOrder::NewestFirst);
     }
     Ok(board)
 }
@@ -347,7 +360,8 @@ fn render_markdown(path: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
         return Err("render output must differ from the JSON board path".into());
     }
     let _lock = BoardLock::acquire(path)?;
-    let board = load_board(path)?;
+    let mut board = load_board(path)?;
+    import_firstmate_stamps(output, &mut board)?;
     let markdown = board_to_markdown(&board);
     write_markdown(output, &markdown)?;
     println!(
@@ -356,6 +370,61 @@ fn render_markdown(path: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
         output.display()
     );
     Ok(())
+}
+
+fn import_firstmate_stamps(path: &Path, board: &mut Board) -> Result<(), Box<dyn Error>> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut task_id = None;
+    let mut stamp = None;
+    for line in contents.lines() {
+        if let Some(marker) = line.strip_prefix("<!-- choco: channel=") {
+            append_firstmate_stamp(board, task_id.take(), stamp.take());
+            let Some((_, id)) = marker.split_once(" id=") else {
+                continue;
+            };
+            task_id = id.strip_suffix(" -->").map(str::to_owned);
+            continue;
+        }
+        if let Some(quoted) = line.strip_prefix("> ") {
+            if let Some(firstmate) = quoted.strip_prefix("Firstmate:") {
+                append_firstmate_stamp(board, task_id.clone(), stamp.take());
+                stamp = Some(firstmate.trim_start().to_owned());
+            } else if let Some(existing) = stamp.as_mut() {
+                existing.push('\n');
+                existing.push_str(quoted);
+            }
+        } else {
+            append_firstmate_stamp(board, task_id.clone(), stamp.take());
+        }
+    }
+    append_firstmate_stamp(board, task_id, stamp);
+    Ok(())
+}
+
+fn append_firstmate_stamp(board: &mut Board, task_id: Option<String>, stamp: Option<String>) {
+    let (Some(task_id), Some(stamp)) = (task_id, stamp) else {
+        return;
+    };
+    let Some(task) = board.tasks.iter_mut().find(|task| task.id == task_id) else {
+        return;
+    };
+    let body = format!("Firstmate: {stamp}");
+    if task
+        .replies
+        .iter()
+        .any(|reply| reply.author.eq_ignore_ascii_case("firstmate") && reply.body == body)
+    {
+        return;
+    }
+    task.replies.push(Reply {
+        id: new_id(),
+        author: "firstmate".into(),
+        body,
+    });
 }
 
 fn board_to_markdown(board: &Board) -> String {
@@ -1359,6 +1428,50 @@ mod tests {
         assert!(
             markdown.contains("> Firstmate: **08-24-2026 21:16:34.** stamped\n\n> jon: A reply")
         );
+    }
+
+    #[test]
+    fn markdown_render_imports_stamps_and_migrates_legacy_task_order() {
+        let stem = format!("choco-render-test-{}-{}", process::id(), new_id());
+        let board_path = env::temp_dir().join(format!("{stem}.json"));
+        let markdown_path = env::temp_dir().join(format!("{stem}.md"));
+        let board = Board {
+            tasks: vec![
+                Task {
+                    id: "old".into(),
+                    channel: "general".into(),
+                    title: "Older".into(),
+                    body: String::new(),
+                    replies: Vec::new(),
+                },
+                Task {
+                    id: "new".into(),
+                    channel: "general".into(),
+                    title: "Newest".into(),
+                    body: String::new(),
+                    replies: Vec::new(),
+                },
+            ],
+            task_order: None,
+            ..Board::default()
+        };
+        write_board(&board_path, &board).unwrap();
+        fs::write(
+            &markdown_path,
+            "# Older\n\n<!-- choco: channel=general id=old -->\n\n\
+             # Newest\n\n<!-- choco: channel=general id=new -->\n\n\
+             > Firstmate: **08-24-2026 21:16:34.** stamped\n",
+        )
+        .unwrap();
+
+        render_markdown(&board_path, &markdown_path).unwrap();
+
+        let rendered = fs::read_to_string(&markdown_path).unwrap();
+        assert!(rendered.find("# Newest").unwrap() < rendered.find("# Older").unwrap());
+        assert!(rendered.contains("> Firstmate: **08-24-2026 21:16:34.** stamped"));
+
+        let _ = fs::remove_file(board_path);
+        let _ = fs::remove_file(markdown_path);
     }
 
     #[test]
