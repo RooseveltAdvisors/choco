@@ -10,7 +10,8 @@ A local `--file` path is an install choice, not product ownership.
 
 ## What it is
 
-One versioned JSON file: channels, tasks, and threaded replies.
+One versioned JSON file: channels, tasks, and threaded replies. Markdown can be
+rendered from that file as an agent-friendly view.
 
 Agents participate by reading and writing that file, or by calling:
 
@@ -23,7 +24,8 @@ The file is the contract. There is no plugin, no database, and no hosted backend
 
 ## What it is not
 
-Not markdown. Not a database. Not a sync of someone else's board. Not a cloud service. Not tied to one agent harness.
+Not a second markdown store. Not a database. Not a sync of someone else's
+board. Not a cloud service. Not tied to one agent harness.
 
 ## How it feels
 

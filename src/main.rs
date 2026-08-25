@@ -10,6 +10,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
@@ -37,6 +40,14 @@ struct Board {
     channels: Vec<Channel>,
     #[serde(default)]
     tasks: Vec<Task>,
+    #[serde(default)]
+    task_order: Option<TaskOrder>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TaskOrder {
+    NewestFirst,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +120,7 @@ impl Default for Board {
                 name: "general".into(),
             }],
             tasks: Vec::new(),
+            task_order: Some(TaskOrder::NewestFirst),
         }
     }
 }
@@ -122,6 +134,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     match command {
         Some(Command::Post { channel, title }) => post_task(&path, &channel, &title),
         Some(Command::Reply { task_id, body }) => reply_to_task(&path, &task_id, &body),
+        Some(Command::Render { output }) => render_markdown(&path, &output),
         None => run_tui(path),
     }
 }
@@ -129,6 +142,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 enum Command {
     Post { channel: String, title: String },
     Reply { task_id: String, body: String },
+    Render { output: PathBuf },
 }
 
 fn parse_args() -> Result<(PathBuf, Option<Command>), Box<dyn Error>> {
@@ -168,6 +182,21 @@ fn parse_args() -> Result<(PathBuf, Option<Command>), Box<dyn Error>> {
             }
             Some(Command::Reply { task_id, body })
         }
+        Some("render") => {
+            args.remove(0);
+            if matches!(
+                args.first().map(String::as_str),
+                Some("--markdown") | Some("--output") | Some("-o")
+            ) {
+                args.remove(0);
+            }
+            let output = PathBuf::from(args.first().ok_or("render needs an output path")?);
+            args.remove(0);
+            if !args.is_empty() {
+                return Err("render accepts one output path".into());
+            }
+            Some(Command::Render { output })
+        }
         Some(command) => return Err(format!("unknown command: {command}").into()),
     };
     Ok((path, command))
@@ -177,9 +206,13 @@ fn load_board(path: &Path) -> Result<Board, Box<dyn Error>> {
     if !path.exists() {
         return Ok(Board::default());
     }
-    let board: Board = serde_json::from_reader(File::open(path)?)?;
+    let mut board: Board = serde_json::from_reader(File::open(path)?)?;
     if board.version != 1 {
         return Err(format!("unsupported board version: {}", board.version).into());
+    }
+    if board.task_order.is_none() {
+        board.tasks.reverse();
+        board.task_order = Some(TaskOrder::NewestFirst);
     }
     Ok(board)
 }
@@ -231,18 +264,41 @@ impl Drop for BoardLock {
 
 fn write_board(path: &Path, board: &Board) -> Result<(), Box<dyn Error>> {
     let bytes = serde_json::to_vec_pretty(board)?;
-    let file_name = path.file_name().ok_or("board path has no file name")?;
-    let temp = path.with_file_name(format!(
-        ".{}.{}.tmp",
-        file_name.to_string_lossy(),
-        process::id()
-    ));
-    {
-        let mut file = File::create(&temp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
+    write_atomically(path, &bytes, "board")
+}
+
+fn write_atomically(path: &Path, contents: &[u8], description: &str) -> Result<(), Box<dyn Error>> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("{description} path has no file name"))?;
+    let (temp, mut file) = {
+        let mut created = None;
+        for attempt in 0..100 {
+            let temp = path.with_file_name(format!(
+                ".{}.{}.{}.tmp",
+                file_name.to_string_lossy(),
+                process::id(),
+                attempt
+            ));
+            match OpenOptions::new().write(true).create_new(true).open(&temp) {
+                Ok(file) => {
+                    created = Some((temp, file));
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        created.ok_or("could not create a unique temporary file")?
+    };
+    if let Err(error) = file.write_all(contents).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&temp);
+        return Err(error.into());
     }
-    fs::rename(temp, path)?;
+    if let Err(error) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(temp);
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -265,13 +321,16 @@ fn post_task(path: &Path, channel: &str, title: &str) -> Result<(), Box<dyn Erro
                 name: channel.into(),
             });
         }
-        board.tasks.push(Task {
-            id: new_id(),
-            channel: channel.into(),
-            title: title.into(),
-            body: String::new(),
-            replies: Vec::new(),
-        });
+        board.tasks.insert(
+            0,
+            Task {
+                id: new_id(),
+                channel: channel.into(),
+                title: title.into(),
+                body: String::new(),
+                replies: Vec::new(),
+            },
+        );
         Ok(())
     })?;
     println!("posted to #{channel}");
@@ -294,6 +353,167 @@ fn reply_to_task(path: &Path, task_id: &str, body: &str) -> Result<(), Box<dyn E
     })?;
     println!("replied to {task_id}");
     Ok(())
+}
+
+fn render_markdown(path: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
+    if paths_refer_to_same_file(path, output)? {
+        return Err("render output must differ from the JSON board path".into());
+    }
+    let _lock = BoardLock::acquire(path)?;
+    let mut board = load_board(path)?;
+    import_firstmate_stamps(output, &mut board)?;
+    let markdown = board_to_markdown(&board);
+    write_markdown(output, &markdown)?;
+    println!(
+        "rendered {} tasks to {}",
+        board.tasks.len(),
+        output.display()
+    );
+    Ok(())
+}
+
+fn import_firstmate_stamps(path: &Path, board: &mut Board) -> Result<(), Box<dyn Error>> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut task_id = None;
+    let mut stamp = None;
+    for line in contents.lines() {
+        if let Some(marker) = line.strip_prefix("<!-- choco: channel=") {
+            append_firstmate_stamp(board, task_id.take(), stamp.take());
+            let Some((_, id)) = marker.split_once(" id=") else {
+                continue;
+            };
+            task_id = id.strip_suffix(" -->").map(str::to_owned);
+            continue;
+        }
+        if let Some(quoted) = line.strip_prefix("> ") {
+            if let Some(firstmate) = quoted.strip_prefix("Firstmate:") {
+                append_firstmate_stamp(board, task_id.clone(), stamp.take());
+                stamp = Some(firstmate.trim_start().to_owned());
+            } else if let Some(existing) = stamp.as_mut() {
+                existing.push('\n');
+                existing.push_str(quoted);
+            }
+        } else {
+            append_firstmate_stamp(board, task_id.clone(), stamp.take());
+        }
+    }
+    append_firstmate_stamp(board, task_id, stamp);
+    Ok(())
+}
+
+fn append_firstmate_stamp(board: &mut Board, task_id: Option<String>, stamp: Option<String>) {
+    let (Some(task_id), Some(stamp)) = (task_id, stamp) else {
+        return;
+    };
+    let Some(task) = board.tasks.iter_mut().find(|task| task.id == task_id) else {
+        return;
+    };
+    let body = format!("Firstmate: {stamp}");
+    if task
+        .replies
+        .iter()
+        .any(|reply| reply.author.eq_ignore_ascii_case("firstmate") && reply.body == body)
+    {
+        return;
+    }
+    task.replies.push(Reply {
+        id: new_id(),
+        author: "firstmate".into(),
+        body,
+    });
+}
+
+fn board_to_markdown(board: &Board) -> String {
+    let mut markdown = String::new();
+    for (index, task) in board.tasks.iter().enumerate() {
+        if index > 0 {
+            markdown.push('\n');
+        }
+        markdown.push_str("# ");
+        markdown.push_str(&task.title);
+        markdown.push_str("\n\n");
+        markdown.push_str("<!-- choco: channel=");
+        markdown.push_str(&task.channel);
+        markdown.push_str(" id=");
+        markdown.push_str(&task.id);
+        markdown.push_str(" -->\n");
+        if !task.body.is_empty() {
+            markdown.push('\n');
+            markdown.push_str(&task.body);
+            markdown.push('\n');
+        }
+        for reply in &task.replies {
+            markdown.push('\n');
+            markdown.push_str("> ");
+            if !(reply.author.eq_ignore_ascii_case("firstmate")
+                && reply.body.starts_with("Firstmate:"))
+            {
+                markdown.push_str(&reply.author);
+                markdown.push_str(": ");
+            }
+            for (index, line) in reply.body.lines().enumerate() {
+                if index > 0 {
+                    markdown.push_str("\n> ");
+                }
+                markdown.push_str(line);
+            }
+            markdown.push('\n');
+        }
+    }
+    markdown
+}
+
+fn write_markdown(path: &Path, markdown: &str) -> Result<(), Box<dyn Error>> {
+    write_atomically(path, markdown.as_bytes(), "markdown")
+}
+
+fn paths_refer_to_same_file(first: &Path, second: &Path) -> io::Result<bool> {
+    let first = comparable_path(first)?;
+    let second = comparable_path(second)?;
+    if first == second {
+        return Ok(true);
+    }
+
+    #[cfg(unix)]
+    {
+        let first_metadata = match fs::metadata(first) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let second_metadata = match fs::metadata(second) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        Ok(first_metadata.dev() == second_metadata.dev()
+            && first_metadata.ino() == second_metadata.ino())
+    }
+
+    #[cfg(not(unix))]
+    Ok(false)
+}
+
+fn comparable_path(path: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()?.join(path)
+    };
+    if let Ok(canonical) = fs::canonicalize(&absolute) {
+        return Ok(canonical);
+    }
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    let file_name = absolute
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    Ok(fs::canonicalize(parent)?.join(file_name))
 }
 
 fn new_id() -> String {
@@ -768,13 +988,16 @@ impl App {
                     }
                     let id = new_id();
                     created_task_id = Some(id.clone());
-                    board.tasks.push(Task {
-                        id,
-                        channel: channel.clone(),
-                        title: text.clone(),
-                        body: String::new(),
-                        replies: Vec::new(),
-                    });
+                    board.tasks.insert(
+                        0,
+                        Task {
+                            id,
+                            channel: channel.clone(),
+                            title: text.clone(),
+                            body: String::new(),
+                            replies: Vec::new(),
+                        },
+                    );
                 }
                 EditorMode::EditTask => {
                     let task = board
@@ -1167,6 +1390,107 @@ mod tests {
     }
 
     #[test]
+    fn markdown_render_keeps_card_order_and_existing_firstmate_stamps() {
+        let board = Board {
+            tasks: vec![
+                Task {
+                    id: "new".into(),
+                    channel: "general".into(),
+                    title: "Newest".into(),
+                    body: "Do this first.".into(),
+                    replies: vec![
+                        Reply {
+                            id: "stamp".into(),
+                            author: "firstmate".into(),
+                            body: "Firstmate: **08-24-2026 21:16:34.** stamped".into(),
+                        },
+                        Reply {
+                            id: "reply".into(),
+                            author: "jon".into(),
+                            body: "A reply".into(),
+                        },
+                    ],
+                },
+                Task {
+                    id: "old".into(),
+                    channel: "awaiting".into(),
+                    title: "Older".into(),
+                    body: String::new(),
+                    replies: Vec::new(),
+                },
+            ],
+            ..Board::default()
+        };
+
+        let markdown = board_to_markdown(&board);
+        assert!(markdown.find("# Newest").unwrap() < markdown.find("# Older").unwrap());
+        assert!(markdown.contains("<!-- choco: channel=general id=new -->"));
+        assert!(
+            markdown.contains("> Firstmate: **08-24-2026 21:16:34.** stamped\n\n> jon: A reply")
+        );
+    }
+
+    #[test]
+    fn markdown_render_imports_stamps_and_migrates_legacy_task_order() {
+        let stem = format!("choco-render-test-{}-{}", process::id(), new_id());
+        let board_path = env::temp_dir().join(format!("{stem}.json"));
+        let markdown_path = env::temp_dir().join(format!("{stem}.md"));
+        let board = Board {
+            tasks: vec![
+                Task {
+                    id: "old".into(),
+                    channel: "general".into(),
+                    title: "Older".into(),
+                    body: String::new(),
+                    replies: Vec::new(),
+                },
+                Task {
+                    id: "new".into(),
+                    channel: "general".into(),
+                    title: "Newest".into(),
+                    body: String::new(),
+                    replies: Vec::new(),
+                },
+            ],
+            task_order: None,
+            ..Board::default()
+        };
+        write_board(&board_path, &board).unwrap();
+        fs::write(
+            &markdown_path,
+            "# Older\n\n<!-- choco: channel=general id=old -->\n\n\
+             # Newest\n\n<!-- choco: channel=general id=new -->\n\n\
+             > Firstmate: **08-24-2026 21:16:34.** stamped\n",
+        )
+        .unwrap();
+
+        render_markdown(&board_path, &markdown_path).unwrap();
+
+        let rendered = fs::read_to_string(&markdown_path).unwrap();
+        assert!(rendered.find("# Newest").unwrap() < rendered.find("# Older").unwrap());
+        assert!(rendered.contains("> Firstmate: **08-24-2026 21:16:34.** stamped"));
+
+        let _ = fs::remove_file(board_path);
+        let _ = fs::remove_file(markdown_path);
+    }
+
+    #[test]
+    fn markdown_render_rejects_overwriting_the_json_board() {
+        let path = env::temp_dir().join(format!(
+            "choco-render-test-{}-{}.json",
+            process::id(),
+            new_id()
+        ));
+        write_board(&path, &Board::default()).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        assert!(render_markdown(&path, &path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn editor_submission_selects_new_task_and_updates_existing_task() {
         let path = env::temp_dir().join(format!("choco-test-{}-{}.json", process::id(), new_id()));
         let mut app = App {
@@ -1188,6 +1512,7 @@ mod tests {
 
         app.submit_input(EditorMode::NewTask, "second task")
             .unwrap();
+        assert_eq!(app.board.tasks[0].title, "second task");
         app.submit_input(EditorMode::Reply, "existing reply")
             .unwrap();
         let replies = app.selected_task().unwrap().replies.clone();
@@ -1203,8 +1528,17 @@ mod tests {
         assert_eq!(app.selected_task().unwrap().title, "renamed task");
         assert_eq!(app.selected_task().unwrap().body, "updated body");
         assert_eq!(app.selected_task().unwrap().replies, replies);
-        assert_eq!(load_board(&path).unwrap().tasks[0].replies, replies);
-        assert_eq!(app.task_idx, 0);
+        assert_eq!(
+            load_board(&path)
+                .unwrap()
+                .tasks
+                .iter()
+                .find(|task| task.title == "renamed task")
+                .unwrap()
+                .replies,
+            replies
+        );
+        assert_eq!(app.selected_task().unwrap().title, "renamed task");
 
         let _ = fs::remove_file(path);
     }
