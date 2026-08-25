@@ -6,7 +6,9 @@ use std::{
     hash::{Hash, Hasher},
     io::{self, Write},
     path::{Path, PathBuf},
-    process, thread,
+    process,
+    sync::atomic::{AtomicU64, Ordering},
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -30,6 +32,8 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_FILE: &str = "choco.json";
 const TASK_REPLIES_MARKER: &str = "--- Replies (preserved on save) ---";
+const SEARCH_LABELS: &str = "asdfghjklqwertyuiopzxcvbnm";
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -108,6 +112,7 @@ struct App {
     detail_scroll: u16,
     search_query: Option<String>,
     search_input: Option<String>,
+    search_selecting: bool,
     pending_g: bool,
 }
 
@@ -521,7 +526,11 @@ fn new_id() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    format!("{millis}-{}", process::id())
+    format!(
+        "{millis}-{}-{}",
+        process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn author() -> String {
@@ -543,6 +552,7 @@ fn run_tui(path: PathBuf) -> Result<(), Box<dyn Error>> {
         detail_scroll: 0,
         search_query: None,
         search_input: None,
+        search_selecting: false,
         pending_g: false,
     };
     let mut terminal = setup_terminal()?;
@@ -777,7 +787,8 @@ impl App {
             KeyCode::Char('G') => self.jump_to_boundary(true),
             KeyCode::Char('/') => {
                 self.search_input = Some(String::new());
-                self.status = "/".into();
+                self.search_selecting = false;
+                self.update_search_status();
             }
             KeyCode::Char('n') if self.search_query.is_some() => self.find_match(1),
             KeyCode::Char('N') if self.search_query.is_some() => self.find_match(-1),
@@ -818,39 +829,118 @@ impl App {
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) {
-        let Some(input) = self.search_input.as_mut() else {
+        let Some(input) = self.search_input.clone() else {
             return;
         };
         match key.code {
             KeyCode::Esc => {
                 self.search_input = None;
+                self.search_selecting = false;
+                self.search_query = None;
                 self.status = "search cancelled".into();
             }
             KeyCode::Enter => {
                 let query = input.trim().to_string();
-                self.search_input = None;
                 if query.is_empty() {
+                    self.search_input = None;
+                    self.search_selecting = false;
                     self.search_query = None;
                     self.status = "search cleared".into();
                 } else {
+                    self.search_input = Some(query.clone());
                     self.search_query = Some(query);
-                    self.find_match(1);
+                    self.search_selecting = true;
+                    self.update_search_status();
                 }
             }
             KeyCode::Backspace => {
-                input.pop();
-                self.status = format!("/{}", input);
+                self.search_selecting = false;
+                if let Some(input) = self.search_input.as_mut() {
+                    input.pop();
+                }
+                self.update_search_status();
             }
             KeyCode::Char(character)
                 if !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                input.push(character);
-                self.status = format!("/{}", input);
+                if self.search_selecting {
+                    if let Some(task_idx) = self.search_label_target(character) {
+                        self.select_search_candidate(task_idx, character);
+                    }
+                } else if let Some(input) = self.search_input.as_mut() {
+                    input.push(character);
+                    self.update_search_status();
+                }
             }
             _ => {}
         }
+    }
+
+    fn update_search_status(&mut self) {
+        let query = self.search_input.as_deref().unwrap_or_default();
+        let shown = self.search_candidates().len();
+        let total = self.search_match_count();
+        self.status = format!(
+            "/{query}  {}{} candidates  {}",
+            shown,
+            if shown < total {
+                format!(" of {total}")
+            } else {
+                String::new()
+            },
+            if self.search_selecting {
+                "press a letter to jump"
+            } else {
+                "type to narrow, Enter labels"
+            }
+        );
+    }
+
+    fn search_candidates(&self) -> Vec<(usize, &Task)> {
+        let Some(query) = self.search_input.as_deref() else {
+            return Vec::new();
+        };
+        self.visible_tasks()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, task)| task_matches(task, query))
+            .take(SEARCH_LABELS.chars().count())
+            .collect()
+    }
+
+    fn search_match_count(&self) -> usize {
+        let Some(query) = self.search_input.as_deref() else {
+            return 0;
+        };
+        self.visible_tasks()
+            .into_iter()
+            .filter(|task| task_matches(task, query))
+            .count()
+    }
+
+    fn search_label_target(&self, label: char) -> Option<usize> {
+        for (candidate_idx, (task_idx, _)) in self.search_candidates().into_iter().enumerate() {
+            if SEARCH_LABELS.chars().nth(candidate_idx) == Some(label) {
+                return Some(task_idx);
+            }
+        }
+        None
+    }
+
+    fn select_search_candidate(&mut self, task_idx: usize, label: char) {
+        let query = self.search_input.take().unwrap_or_default();
+        self.search_selecting = false;
+        self.search_query = if query.is_empty() {
+            None
+        } else {
+            Some(query.clone())
+        };
+        self.task_idx = task_idx;
+        self.focus = Focus::Tasks;
+        self.detail_scroll = 0;
+        self.status = format!("/{query}  [{label}] selected");
     }
 
     fn find_match(&mut self, delta: isize) {
@@ -1135,7 +1225,11 @@ impl App {
             ]),
             Line::from(Span::styled(
                 if let Some(query) = &self.search_input {
-                    format!(" /{query}  Enter search   Esc cancel")
+                    if self.search_selecting {
+                        format!(" /{query}  press a letter to jump   Esc cancel")
+                    } else {
+                        format!(" /{query}  type to narrow   Enter labels   Esc cancel")
+                    }
                 } else {
                     " hjkl move   gg/G top/bottom   / search   n/N next   Ctrl-u/d scroll   Enter edit   n new task   r reply   q quit".into()
                 },
@@ -1249,21 +1343,50 @@ impl App {
     }
 
     fn draw_tasks(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        let items = self
-            .visible_tasks()
-            .iter()
-            .enumerate()
-            .map(|(index, task)| {
+        let tasks = if self.search_input.is_some() {
+            self.search_candidates()
+                .into_iter()
+                .enumerate()
+                .map(|(candidate_idx, (task_idx, task))| {
+                    (SEARCH_LABELS.chars().nth(candidate_idx), task_idx, task)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            self.visible_tasks()
+                .into_iter()
+                .enumerate()
+                .map(|(task_idx, task)| (None, task_idx, task))
+                .collect::<Vec<_>>()
+        };
+        let items = tasks
+            .into_iter()
+            .map(|(label, index, task)| {
                 let marker = if index == self.task_idx && self.focus == Focus::Tasks {
                     "›"
                 } else {
                     " "
                 };
-                let item = ListItem::new(format!(
-                    "{marker} {}  ({} replies)",
-                    task.title,
-                    task.replies.len()
-                ));
+                let item = if let Some(label) = label {
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            format!("{label} "),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(format!(
+                            "{marker} {}  ({} replies)",
+                            task.title,
+                            task.replies.len()
+                        )),
+                    ]))
+                } else {
+                    ListItem::new(format!(
+                        "{marker} {}  ({} replies)",
+                        task.title,
+                        task.replies.len()
+                    ))
+                };
                 if index == self.task_idx && self.focus == Focus::Tasks {
                     item.style(
                         Style::default()
@@ -1380,6 +1503,203 @@ mod tests {
         assert!(task_matches(&task, "thread"));
         assert!(task_matches(&task, "CAPTAIN"));
         assert!(!task_matches(&task, "missing"));
+    }
+
+    #[test]
+    fn slash_search_narrows_candidates_and_letter_selects_one() {
+        let mut app = App {
+            path: PathBuf::new(),
+            board: Board {
+                tasks: vec![
+                    Task {
+                        id: "alpha".into(),
+                        channel: "general".into(),
+                        title: "Alpha task".into(),
+                        body: String::new(),
+                        replies: Vec::new(),
+                    },
+                    Task {
+                        id: "beta".into(),
+                        channel: "general".into(),
+                        title: "Beta task".into(),
+                        body: String::new(),
+                        replies: Vec::new(),
+                    },
+                    Task {
+                        id: "alphabet".into(),
+                        channel: "general".into(),
+                        title: "Alphabet task".into(),
+                        body: String::new(),
+                        replies: Vec::new(),
+                    },
+                ],
+                ..Board::default()
+            },
+            channel_idx: 0,
+            task_idx: 0,
+            focus: Focus::Tasks,
+            file_marker: None,
+            status: String::new(),
+            detail_scroll: 0,
+            search_query: None,
+            search_input: Some(String::new()),
+            search_selecting: false,
+            pending_g: false,
+        };
+
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(app.search_candidates().len(), 3);
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.search_input.as_deref(), Some("al"));
+        assert_eq!(app.search_candidates().len(), 2);
+        assert_eq!(app.search_label_target('s'), Some(2));
+
+        app.handle_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.search_selecting);
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(app.search_input.is_none());
+        assert_eq!(app.search_query.as_deref(), Some("al"));
+        assert_eq!(app.selected_task().unwrap().id, "alphabet");
+        assert!(app.status.contains("[s] selected"));
+
+        app.search_input = Some("al".into());
+        app.search_selecting = false;
+        app.handle_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.search_selecting);
+        app.handle_search_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(app.selected_task().unwrap().id, "alpha");
+
+        app.search_input = Some("al".into());
+        app.search_query = Some("al".into());
+        app.search_selecting = true;
+        app.handle_search_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.search_query.is_none());
+        assert!(app.search_input.is_none());
+        assert!(!app.search_selecting);
+    }
+
+    fn search_test_app(tasks: Vec<Task>) -> App {
+        App {
+            path: PathBuf::new(),
+            board: Board {
+                tasks,
+                ..Board::default()
+            },
+            channel_idx: 0,
+            task_idx: 0,
+            focus: Focus::Tasks,
+            file_marker: None,
+            status: String::new(),
+            detail_scroll: 0,
+            search_query: None,
+            search_input: None,
+            search_selecting: false,
+            pending_g: false,
+        }
+    }
+
+    fn press_search(app: &mut App, code: KeyCode) {
+        app.handle_search_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn render_screen(app: &App) -> String {
+        render_screen_sized(app, 120, 20)
+    }
+
+    fn render_screen_sized(app: &App, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        format!("{}", terminal.backend())
+    }
+
+    #[test]
+    fn slash_search_caps_labels_at_26_and_indicates_total() {
+        let tasks = (0..30)
+            .map(|i| Task {
+                id: format!("t{i}"),
+                channel: "general".into(),
+                title: format!("Task {i:02}"),
+                body: String::new(),
+                replies: Vec::new(),
+            })
+            .collect();
+        let mut app = search_test_app(tasks);
+        app.search_input = Some(String::new());
+        press_search(&mut app, KeyCode::Char('t'));
+
+        assert_eq!(app.search_candidates().len(), 26);
+        assert_eq!(app.search_match_count(), 30);
+        assert!(app.status.contains("26 of 30"));
+        assert!(app.status.contains("type to narrow, Enter labels"));
+        assert_eq!(app.search_label_target('a'), Some(0));
+        assert_eq!(app.search_label_target('m'), Some(25));
+        assert!(app.search_label_target('1').is_none());
+
+        let screen = render_screen_sized(&app, 120, 40);
+        assert!(screen.contains("a › Task 00"), "{screen}");
+        assert!(screen.contains("m   Task 25"), "{screen}");
+        assert!(!screen.contains("Task 26"), "{screen}");
+        assert!(!screen.contains("Task 29"), "{screen}");
+        assert!(screen.contains("26 of 30"), "{screen}");
+
+        press_search(&mut app, KeyCode::Enter);
+        assert!(app.search_selecting);
+        assert!(app.status.contains("press a letter to jump"));
+        let labeled = render_screen(&app);
+        assert!(labeled.contains("press a letter to jump"), "{labeled}");
+
+        press_search(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.selected_task().unwrap().id, "t1");
+        assert!(app.search_input.is_none());
+        assert_eq!(app.search_query.as_deref(), Some("t"));
+        assert!(app.status.contains("[s] selected"));
+
+        app.find_match(1);
+        assert_eq!(app.selected_task().unwrap().id, "t2");
+        app.find_match(-1);
+        assert_eq!(app.selected_task().unwrap().id, "t1");
+    }
+
+    #[test]
+    fn slash_search_renders_live_labels_before_enter() {
+        let mut app = search_test_app(vec![
+            Task {
+                id: "alpha".into(),
+                channel: "general".into(),
+                title: "Alpha task".into(),
+                body: String::new(),
+                replies: Vec::new(),
+            },
+            Task {
+                id: "beta".into(),
+                channel: "general".into(),
+                title: "Beta task".into(),
+                body: String::new(),
+                replies: Vec::new(),
+            },
+            Task {
+                id: "alphabet".into(),
+                channel: "general".into(),
+                title: "Alphabet task".into(),
+                body: String::new(),
+                replies: Vec::new(),
+            },
+        ]);
+        app.search_input = Some(String::new());
+        press_search(&mut app, KeyCode::Char('a'));
+        press_search(&mut app, KeyCode::Char('l'));
+
+        let screen = render_screen(&app);
+        assert!(screen.contains("/al"), "{screen}");
+        assert!(screen.contains("type to narrow"), "{screen}");
+        assert!(screen.contains("Enter labels"), "{screen}");
+        assert!(screen.contains("a "), "{screen}");
+        assert!(screen.contains("s "), "{screen}");
+        assert!(screen.contains("Alpha task"), "{screen}");
+        assert!(screen.contains("Alphabet task"), "{screen}");
+        assert!(!screen.contains("Beta task"), "{screen}");
+        assert!(app.status.contains("2 candidates"), "{}", app.status);
     }
 
     #[test]
@@ -1504,6 +1824,7 @@ mod tests {
             detail_scroll: 0,
             search_query: None,
             search_input: None,
+            search_selecting: false,
             pending_g: false,
         };
 
