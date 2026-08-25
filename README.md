@@ -35,12 +35,17 @@ integration. The CLI is also intentionally small:
 ```sh
 choco --file choco.json post --channel general "Investigate the flaky test"
 choco --file choco.json reply TASK_ID "I found the cause"
+choco --file choco.json render --markdown /path/to/todo.md
 ```
 
 `post` creates a missing channel automatically. `CHOCO_AUTHOR` sets the author
 for replies and defaults to `$USER`. Choco serializes writers with a small
 lock file and rejects unsupported versions or unknown fields instead of
 silently dropping data.
+
+`render` writes a markdown view of the JSON board atomically. Tasks remain
+newest-first, and existing Firstmate stamp text is preserved on its task card.
+The output path is explicit so Choco remains independent of any harness.
 
 The file format is versioned and contains `channels`, `tasks`, each task's
 `title`, `body`, and `replies`. The `body` field may be omitted when loading
