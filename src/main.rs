@@ -32,6 +32,8 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_FILE: &str = "choco.json";
 const TASK_REPLIES_MARKER: &str = "--- Replies (preserved on save) ---";
+const MARKDOWN_STORE_READ_ONLY: &str =
+    "markdown stores are read-only until write-back support is added";
 const SEARCH_LABELS: &str = "asdfghjklqwertyuiopzxcvbnm";
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -211,6 +213,9 @@ fn load_board(path: &Path) -> Result<Board, Box<dyn Error>> {
     if !path.exists() {
         return Ok(Board::default());
     }
+    if is_markdown_store(path) {
+        return load_markdown_board(path);
+    }
     let mut board: Board = serde_json::from_reader(File::open(path)?)?;
     if board.version != 1 {
         return Err(format!("unsupported board version: {}", board.version).into());
@@ -220,6 +225,132 @@ fn load_board(path: &Path) -> Result<Board, Box<dyn Error>> {
         board.task_order = Some(TaskOrder::NewestFirst);
     }
     Ok(board)
+}
+
+fn is_markdown_store(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+}
+
+fn load_markdown_board(path: &Path) -> Result<Board, Box<dyn Error>> {
+    let contents = fs::read_to_string(path)?;
+    let mut tasks = Vec::new();
+    let mut title = None;
+    let mut body = Vec::new();
+    let mut fence = None;
+
+    for line in contents.lines() {
+        if let Some(spec) = fence {
+            if fence_closes(line, spec) {
+                fence = None;
+            }
+        } else if let Some(spec) = fence_starts(line) {
+            fence = Some(spec);
+        }
+        if fence.is_none()
+            && let Some(next_title) = markdown_heading(line)
+        {
+            if let Some(title) = title.take() {
+                tasks.push(markdown_task(tasks.len(), title, &body));
+                body.clear();
+            }
+            title = Some(next_title.trim().to_string());
+        } else if title.is_some() {
+            body.push(line);
+        }
+    }
+    if let Some(title) = title {
+        tasks.push(markdown_task(tasks.len(), title, &body));
+    }
+
+    Ok(Board {
+        channels: vec![Channel {
+            id: "general".into(),
+            name: "general".into(),
+        }],
+        tasks,
+        task_order: Some(TaskOrder::NewestFirst),
+        ..Board::default()
+    })
+}
+
+fn markdown_heading(line: &str) -> Option<&str> {
+    let indentation = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indentation > 3 {
+        return None;
+    }
+    let heading = line[indentation..].strip_prefix('#')?;
+    if !heading
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| *byte == b' ' || *byte == b'\t')
+    {
+        return None;
+    }
+    let title = heading.trim_start_matches([' ', '\t']).trim_end();
+    let hash_count = title.len() - title.trim_end_matches('#').len();
+    let hash_start = title.len() - hash_count;
+    if hash_start == 0 {
+        return None;
+    }
+    let title = if hash_count > 0
+        && title[..hash_start]
+            .chars()
+            .last()
+            .is_some_and(|character| character.is_whitespace())
+    {
+        title[..hash_start].trim_end()
+    } else {
+        title
+    };
+    (!title.is_empty()).then_some(title)
+}
+
+fn fence_starts(line: &str) -> Option<(char, usize)> {
+    let (character, length, _) = fence_parts(line)?;
+    Some((character, length))
+}
+
+fn fence_closes(line: &str, (character, length): (char, usize)) -> bool {
+    let Some((closing_character, closing_length, suffix)) = fence_parts(line) else {
+        return false;
+    };
+    closing_character == character && closing_length >= length && suffix.trim().is_empty()
+}
+
+fn fence_parts(line: &str) -> Option<(char, usize, &str)> {
+    let indentation = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indentation > 3 {
+        return None;
+    }
+    let rest = &line[indentation..];
+    let character = rest.chars().next()?;
+    if character != '`' && character != '~' {
+        return None;
+    }
+    let length = rest.chars().take_while(|item| *item == character).count();
+    (length >= 3).then(|| {
+        let suffix = &rest[character.len_utf8() * length..];
+        if character == '`' && suffix.contains('`') {
+            return None;
+        }
+        Some((character, length, suffix))
+    })?
+}
+
+fn markdown_task(index: usize, title: String, body: &[&str]) -> Task {
+    Task {
+        id: format!("markdown-{}", index + 1),
+        channel: "general".into(),
+        title,
+        body: body
+            .iter()
+            .position(|line| !line.trim().is_empty())
+            .zip(body.iter().rposition(|line| !line.trim().is_empty()))
+            .map(|(start, end)| body[start..=end].join("\n"))
+            .unwrap_or_default(),
+        replies: Vec::new(),
+    }
 }
 
 fn marker(path: &Path) -> io::Result<Option<FileMarker>> {
@@ -268,6 +399,9 @@ impl Drop for BoardLock {
 }
 
 fn write_board(path: &Path, board: &Board) -> Result<(), Box<dyn Error>> {
+    if is_markdown_store(path) {
+        return Err(MARKDOWN_STORE_READ_ONLY.into());
+    }
     let bytes = serde_json::to_vec_pretty(board)?;
     write_atomically(path, &bytes, "board")
 }
@@ -311,6 +445,9 @@ fn update_board<F>(path: &Path, update: F) -> Result<Board, Box<dyn Error>>
 where
     F: FnOnce(&mut Board) -> Result<(), Box<dyn Error>>,
 {
+    if is_markdown_store(path) {
+        return Err(MARKDOWN_STORE_READ_ONLY.into());
+    }
     let _lock = BoardLock::acquire(path)?;
     let mut board = load_board(path)?;
     update(&mut board)?;
@@ -992,6 +1129,10 @@ impl App {
         terminal: &mut DefaultTerminal,
         mode: EditorMode,
     ) -> Result<(), Box<dyn Error>> {
+        if is_markdown_store(&self.path) {
+            self.status = MARKDOWN_STORE_READ_ONLY.into();
+            return Ok(());
+        }
         let existing = match mode {
             EditorMode::EditTask => self
                 .selected_task()
@@ -1808,6 +1949,51 @@ mod tests {
 
         let _ = fs::remove_file(board_path);
         let _ = fs::remove_file(markdown_path);
+    }
+
+    #[test]
+    fn markdown_store_reads_cards_in_order_and_does_not_accept_json_writes() {
+        let stem = format!("choco-markdown-store-test-{}-{}", process::id(), new_id());
+        let path = env::temp_dir().join(format!("{stem}.md"));
+        fs::write(
+            &path,
+            "# Current newest\n\n> Firstmate: stamped <!-- zeta-todo-write:1 -->\n\n\
+             captain context\n    indented code\n\n```text\n# heading in task content\n```\n\n\
+             ````text\n~~~\n# heading in mixed fence\n```\n# heading in long fence\n````\n\n\
+             #\tCurrent oldest #\n\nolder context\n",
+        )
+        .unwrap();
+
+        let board = load_board(&path).unwrap();
+        assert_eq!(
+            board
+                .tasks
+                .iter()
+                .map(|task| task.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Current newest", "Current oldest"]
+        );
+        assert_eq!(
+            board.tasks[0].body,
+            "> Firstmate: stamped <!-- zeta-todo-write:1 -->\n\n\
+             captain context\n    indented code\n\n```text\n# heading in task content\n```\n\n\
+             ````text\n~~~\n# heading in mixed fence\n```\n# heading in long fence\n````"
+        );
+        assert_eq!(board.tasks[1].body, "older context");
+        assert_eq!(board.tasks[0].channel, "general");
+        assert_eq!(board.task_order, Some(TaskOrder::NewestFirst));
+        assert_eq!(fence_starts("````text"), Some(('`', 4)));
+        assert!(fence_starts("```bad`").is_none());
+        assert!(markdown_heading("# #").is_none());
+        assert!(markdown_heading("# ###").is_none());
+
+        let before = fs::read(&path).unwrap();
+        assert!(write_board(&path, &board).is_err());
+        assert!(post_task(&path, "general", "new task").is_err());
+        assert!(reply_to_task(&path, "markdown-1", "new reply").is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
