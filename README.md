@@ -48,8 +48,11 @@ newest-first, and existing Firstmate stamp text is preserved on its task card.
 The output path is explicit so Choco remains independent of any harness.
 
 The file format is versioned and contains `channels`, `tasks`, each task's
-`title`, `body`, and `replies`. The `body` field may be omitted when loading
-older boards and defaults to empty. A minimal board is:
+`title`, `body`, and `replies`, plus the `task_order` value
+`"newest_first"` written by current Choco versions. Boards without
+`task_order` are treated as newest-first when loaded. The `body` field
+may be omitted when loading older boards and defaults to empty. A minimal
+board is:
 
 ```json
 {"version":1,"channels":[{"id":"general","name":"general"}],"tasks":[]}
