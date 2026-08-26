@@ -39,9 +39,10 @@ partial board.
 The board can be plain JSON, so any harness can read or write it without a
 Choco integration. A `.md` `--file` is also supported: each top-level `#`
 heading is a task, its following content is the body, and cards are shown in
-file order. Markdown stores are currently read-only; JSON remains supported
-for existing boards and write-oriented harnesses. The CLI is intentionally
-small:
+file order. Body content, including Firstmate or `zeta-todo-write` stamps, is
+preserved as task content. Markdown stores are currently read-only; JSON
+remains supported for existing boards and write-oriented harnesses. The CLI is
+intentionally small:
 
 ```sh
 choco --file choco.json post --channel general "Investigate the flaky test"
