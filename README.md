@@ -48,10 +48,11 @@ choco --file /path/to/todo.md reply markdown-1 "I found the cause"
 choco --file choco.json render --markdown /path/to/todo.md
 ```
 
-`post` creates a missing channel automatically. `CHOCO_AUTHOR` sets the author
-for replies and defaults to `$USER`. Choco serializes writers with a small
-lock file and rejects unsupported versions or unknown fields instead of
-silently dropping data.
+On JSON stores, `post` creates a missing channel automatically. Markdown stores
+support only the `general` channel. `CHOCO_AUTHOR` sets the author for replies
+and defaults to `$USER`. Choco serializes writers with a small lock file and
+rejects unsupported versions or unknown fields instead of silently dropping
+data.
 
 `render` writes a markdown view of the JSON board atomically. Tasks remain
 newest-first, and existing Firstmate stamp text is preserved on its task card.

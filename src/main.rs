@@ -7,16 +7,16 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process,
-    sync::{
-        Arc, Barrier,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+
+#[cfg(test)]
+use std::sync::{Arc, Barrier};
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -815,11 +815,7 @@ fn render_markdown(path: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
             .cards
             .len();
         write_atomically(output, &source, "markdown")?;
-        println!(
-            "rendered {} tasks to {}",
-            task_count,
-            output.display()
-        );
+        println!("rendered {} tasks to {}", task_count, output.display());
         return Ok(());
     }
     let board = load_board(path)?;
