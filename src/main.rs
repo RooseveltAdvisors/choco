@@ -806,6 +806,19 @@ fn render_markdown(path: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
         return Err("render output must differ from the board path".into());
     }
     let _lock = BoardLock::acquire(path)?;
+    if is_markdown_store(path) {
+        let source = fs::read(path)?;
+        let task_count = parse_markdown_document(String::from_utf8(source.clone())?)
+            .cards
+            .len();
+        write_atomically(output, &source, "markdown")?;
+        println!(
+            "rendered {} tasks to {}",
+            task_count,
+            output.display()
+        );
+        return Ok(());
+    }
     let board = load_board(path)?;
     let markdown = board_to_markdown(&board);
     write_markdown(output, &markdown)?;
@@ -2239,10 +2252,14 @@ mod tests {
     fn markdown_store_reads_and_writes_fixture_without_losing_unknown_content() {
         let stem = format!("choco-markdown-store-test-{}-{}", process::id(), new_id());
         let path = env::temp_dir().join(format!("{stem}.md"));
+        let rendered_path = env::temp_dir().join(format!("{stem}-rendered.md"));
         let fixture = "# Current newest\n\n> Firstmate: stamped <!-- zeta-todo-write:1 -->\n\n\
 captain context\n    indented code\n\n## nested heading\n\n```text\n# heading in task content\n```\n\n\
 # Current oldest #\n\nolder context\n";
         fs::write(&path, fixture).unwrap();
+
+        render_markdown(&path, &rendered_path).unwrap();
+        assert_eq!(fs::read(&rendered_path).unwrap(), fixture.as_bytes());
 
         let board = load_board(&path).unwrap();
         assert_eq!(
@@ -2341,6 +2358,7 @@ captain context\n    indented code\n\n## nested heading\n\n```text\n# heading in
             "# Created from empty file\n"
         );
         let _ = fs::remove_file(missing_path);
+        let _ = fs::remove_file(rendered_path);
     }
 
     #[test]
