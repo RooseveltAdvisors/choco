@@ -291,8 +291,8 @@ fn load_markdown_board(path: &Path) -> Result<Board, Box<dyn Error>> {
 fn markdown_heading(line: &str) -> Option<&str> {
     let line = line.trim_end_matches(['\r', '\n']);
     let title = line.strip_prefix("# ")?.trim_end();
-    let hash_count = title.len() - title.trim_end_matches('#').len();
-    let hash_start = title.len() - hash_count;
+    let hash_start = title.trim_end_matches('#').len();
+    let hash_count = title.len() - hash_start;
     if hash_start == 0 {
         return None;
     }
@@ -803,11 +803,10 @@ fn apply_markdown_change(
 
 fn render_markdown(path: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
     if paths_refer_to_same_file(path, output)? {
-        return Err("render output must differ from the JSON board path".into());
+        return Err("render output must differ from the board path".into());
     }
     let _lock = BoardLock::acquire(path)?;
-    let mut board = load_board(path)?;
-    import_firstmate_stamps(output, &mut board)?;
+    let board = load_board(path)?;
     let markdown = board_to_markdown(&board);
     write_markdown(output, &markdown)?;
     println!(
@@ -816,61 +815,6 @@ fn render_markdown(path: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
         output.display()
     );
     Ok(())
-}
-
-fn import_firstmate_stamps(path: &Path, board: &mut Board) -> Result<(), Box<dyn Error>> {
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    let mut task_id = None;
-    let mut stamp = None;
-    for line in contents.lines() {
-        if let Some(marker) = line.strip_prefix("<!-- choco: channel=") {
-            append_firstmate_stamp(board, task_id.take(), stamp.take());
-            let Some((_, id)) = marker.split_once(" id=") else {
-                continue;
-            };
-            task_id = id.strip_suffix(" -->").map(str::to_owned);
-            continue;
-        }
-        if let Some(quoted) = line.strip_prefix("> ") {
-            if let Some(firstmate) = quoted.strip_prefix("Firstmate:") {
-                append_firstmate_stamp(board, task_id.clone(), stamp.take());
-                stamp = Some(firstmate.trim_start().to_owned());
-            } else if let Some(existing) = stamp.as_mut() {
-                existing.push('\n');
-                existing.push_str(quoted);
-            }
-        } else {
-            append_firstmate_stamp(board, task_id.clone(), stamp.take());
-        }
-    }
-    append_firstmate_stamp(board, task_id, stamp);
-    Ok(())
-}
-
-fn append_firstmate_stamp(board: &mut Board, task_id: Option<String>, stamp: Option<String>) {
-    let (Some(task_id), Some(stamp)) = (task_id, stamp) else {
-        return;
-    };
-    let Some(task) = board.tasks.iter_mut().find(|task| task.id == task_id) else {
-        return;
-    };
-    let body = format!("Firstmate: {stamp}");
-    if task
-        .replies
-        .iter()
-        .any(|reply| reply.author.eq_ignore_ascii_case("firstmate") && reply.body == body)
-    {
-        return;
-    }
-    task.replies.push(Reply {
-        id: new_id(),
-        author: "firstmate".into(),
-        body,
-    });
 }
 
 fn board_to_markdown(board: &Board) -> String {
@@ -2400,7 +2344,7 @@ captain context\n    indented code\n\n## nested heading\n\n```text\n# heading in
     }
 
     #[test]
-    fn markdown_render_imports_stamps_and_migrates_legacy_task_order() {
+    fn markdown_render_migrates_legacy_task_order_without_external_imports() {
         let stem = format!("choco-render-test-{}-{}", process::id(), new_id());
         let board_path = env::temp_dir().join(format!("{stem}.json"));
         let markdown_path = env::temp_dir().join(format!("{stem}.md"));
@@ -2437,7 +2381,7 @@ captain context\n    indented code\n\n## nested heading\n\n```text\n# heading in
 
         let rendered = fs::read_to_string(&markdown_path).unwrap();
         assert!(rendered.find("# Newest").unwrap() < rendered.find("# Older").unwrap());
-        assert!(rendered.contains("> Firstmate: **08-24-2026 21:16:34.** stamped"));
+        assert!(!rendered.contains("> Firstmate: **08-24-2026 21:16:34.** stamped"));
 
         let _ = fs::remove_file(board_path);
         let _ = fs::remove_file(markdown_path);
