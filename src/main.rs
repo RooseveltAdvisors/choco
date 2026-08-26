@@ -7,7 +7,10 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -2359,6 +2362,42 @@ captain context\n    indented code\n\n## nested heading\n\n```text\n# heading in
         );
         let _ = fs::remove_file(missing_path);
         let _ = fs::remove_file(rendered_path);
+    }
+
+    #[test]
+    fn markdown_atomic_writes_never_expose_partial_contents() {
+        let stem = format!("choco-markdown-atomic-test-{}-{}", process::id(), new_id());
+        let path = env::temp_dir().join(format!("{stem}.md"));
+        let first = format!("# first\n\n{}\n", "a".repeat(256 * 1024));
+        let second = format!("# second\n\n{}\n", "b".repeat(256 * 1024));
+        fs::write(&path, &first).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let writer_barrier = Arc::clone(&barrier);
+        let writer_path = path.clone();
+        let writer_first = first.clone();
+        let writer_second = second.clone();
+        let writer = thread::spawn(move || {
+            writer_barrier.wait();
+            for index in 0..100 {
+                let contents = if index % 2 == 0 {
+                    writer_first.as_bytes()
+                } else {
+                    writer_second.as_bytes()
+                };
+                write_atomically(&writer_path, contents, "markdown").unwrap();
+            }
+        });
+
+        barrier.wait();
+        for _ in 0..5000 {
+            let contents = fs::read(&path).unwrap();
+            assert!(contents == first.as_bytes() || contents == second.as_bytes());
+        }
+        writer.join().unwrap();
+        let contents = fs::read(&path).unwrap();
+        assert!(contents == first.as_bytes() || contents == second.as_bytes());
+        let _ = fs::remove_file(path);
     }
 
     #[test]
