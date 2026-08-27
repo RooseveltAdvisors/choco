@@ -766,17 +766,30 @@ fn archive_markdown(
     };
     let archived = append_markdown_card(&done_source, &archived_card);
 
-    // Keep the archived card recoverable if removing it from the active file fails.
     if marker(path)? != before {
         return Err(EXTERNAL_CHANGE.into());
     }
-    write_atomically_if_unchanged(
+    write_atomically_if_unchanged(path, remaining.as_bytes(), "markdown", Some(before))?;
+    let active_after = marker(path)?;
+    if let Err(error) = write_atomically_if_unchanged(
         &done_path,
         archived.as_bytes(),
         "todo-done markdown",
         Some(done_before),
-    )?;
-    write_atomically_if_unchanged(path, remaining.as_bytes(), "markdown", Some(before))?;
+    ) {
+        return match write_atomically_if_unchanged(
+            path,
+            document.source.as_bytes(),
+            "markdown rollback",
+            Some(active_after),
+        ) {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(format!(
+                "{error}; could not roll back active Markdown: {rollback_error}"
+            )
+            .into()),
+        };
+    }
     load_markdown_board(path)
 }
 
