@@ -12,12 +12,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ffi::CString;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-#[cfg(target_os = "linux")]
-use std::os::unix::ffi::OsStrExt;
 
 #[cfg(test)]
 use std::sync::{Arc, Barrier};
@@ -92,7 +92,6 @@ struct Reply {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileMarker {
-    modified: SystemTime,
     len: u64,
     hash: u64,
 }
@@ -415,19 +414,22 @@ fn markdown_task(index: usize, title: String, body: &str) -> Task {
 }
 
 fn marker(path: &Path) -> io::Result<Option<FileMarker>> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
+    match fs::metadata(path) {
+        Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
-    };
+    }
     let bytes = fs::read(path)?;
+    Ok(Some(marker_for_contents(&bytes)))
+}
+
+fn marker_for_contents(contents: &[u8]) -> FileMarker {
     let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    Ok(Some(FileMarker {
-        modified: metadata.modified()?,
-        len: metadata.len(),
+    contents.hash(&mut hasher);
+    FileMarker {
+        len: contents.len() as u64,
         hash: hasher.finish(),
-    }))
+    }
 }
 
 struct BoardLock {
@@ -495,7 +497,38 @@ unsafe extern "C" {
     ) -> std::os::raw::c_int;
 }
 
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn renameatx_np(
+        fromfd: std::os::raw::c_int,
+        from: *const std::os::raw::c_char,
+        tofd: std::os::raw::c_int,
+        to: *const std::os::raw::c_char,
+        flags: std::os::raw::c_uint,
+    ) -> std::os::raw::c_int;
+}
+
 #[cfg(target_os = "linux")]
+fn exchange_paths(temp: &CString, path: &CString) -> io::Result<()> {
+    let result = unsafe { renameat2(-100, temp.as_ptr(), -100, path.as_ptr(), 2) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn exchange_paths(temp: &CString, path: &CString) -> io::Result<()> {
+    let result = unsafe { renameatx_np(-2, temp.as_ptr(), -2, path.as_ptr(), 2) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn exchange_atomically_if_unchanged(
     temp: &Path,
     path: &Path,
@@ -503,32 +536,16 @@ fn exchange_atomically_if_unchanged(
 ) -> Result<(), Box<dyn Error>> {
     let temp_name = CString::new(temp.as_os_str().as_bytes())?;
     let path_name = CString::new(path.as_os_str().as_bytes())?;
-    let exchange = || {
-        let result = unsafe {
-            renameat2(
-                -100,
-                temp_name.as_ptr(),
-                -100,
-                path_name.as_ptr(),
-                2,
-            )
-        };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    };
+    let exchange = || exchange_paths(&temp_name, &path_name);
 
     exchange()?;
     let previous_marker = match marker(temp) {
         Ok(marker) => marker,
         Err(error) => {
             if let Err(rollback_error) = exchange() {
-                return Err(format!(
-                    "{error}; could not restore active file: {rollback_error}"
-                )
-                .into());
+                return Err(
+                    format!("{error}; could not restore active file: {rollback_error}").into(),
+                );
             }
             return Err(error.into());
         }
@@ -538,10 +555,7 @@ fn exchange_atomically_if_unchanged(
         return Ok(());
     }
     if let Err(error) = exchange() {
-        return Err(format!(
-            "{EXTERNAL_CHANGE}; could not restore active file: {error}"
-        )
-        .into());
+        return Err(format!("{EXTERNAL_CHANGE}; could not restore active file: {error}").into());
     }
     Err(EXTERNAL_CHANGE.into())
 }
@@ -606,16 +620,11 @@ fn write_atomically_if_unchanged(
             }
         }
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if let Some(expected) = expected {
         if let Some(expected) = expected {
             return exchange_atomically_if_unchanged(&temp, path, expected);
         }
-    }
-    #[cfg(not(target_os = "linux"))]
-    if expected.is_some() {
-        let _ = fs::remove_file(&temp);
-        return Err("atomic compare-and-swap is unsupported on this target".into());
     }
     if let Err(error) = fs::rename(&temp, path) {
         let _ = fs::remove_file(temp);
@@ -847,18 +856,7 @@ fn archive_markdown(
         return Err(EXTERNAL_CHANGE.into());
     }
     write_atomically_if_unchanged(path, remaining.as_bytes(), "markdown", Some(before))?;
-    let active_after = match marker(path) {
-        Ok(marker) => marker,
-        Err(error) => {
-            return match write_atomically(path, document.source.as_bytes(), "markdown rollback") {
-                Ok(()) => Err(error.into()),
-                Err(rollback_error) => Err(format!(
-                    "{error}; could not roll back active Markdown: {rollback_error}"
-                )
-                .into()),
-            };
-        }
-    };
+    let active_after = marker_for_contents(remaining.as_bytes());
     if let Err(error) = write_atomically_if_unchanged(
         &done_path,
         archived.as_bytes(),
@@ -869,7 +867,7 @@ fn archive_markdown(
             path,
             document.source.as_bytes(),
             "markdown rollback",
-            Some(active_after),
+            Some(Some(active_after)),
         ) {
             Ok(()) => Err(error),
             Err(rollback_error) => Err(format!(
