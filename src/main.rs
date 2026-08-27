@@ -15,6 +15,9 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
+#[cfg(test)]
+use std::sync::{Arc, Barrier};
+
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
@@ -32,6 +35,8 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_FILE: &str = "choco.json";
 const TASK_REPLIES_MARKER: &str = "--- Replies (preserved on save) ---";
+const MARKDOWN_TARGETED_UPDATE: &str = "markdown boards require a targeted update";
+const EXTERNAL_CHANGE: &str = "board changed externally; reload before saving";
 const SEARCH_LABELS: &str = "asdfghjklqwertyuiopzxcvbnm";
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -86,6 +91,36 @@ struct FileMarker {
     modified: SystemTime,
     len: u64,
     hash: u64,
+}
+
+#[derive(Debug, Clone)]
+struct MarkdownCard {
+    start: usize,
+    heading_end: usize,
+    end: usize,
+    title: String,
+}
+
+#[derive(Debug, Clone)]
+struct MarkdownDocument {
+    source: String,
+    cards: Vec<MarkdownCard>,
+}
+
+enum MarkdownChange {
+    Post {
+        title: String,
+    },
+    Edit {
+        task_index: usize,
+        title: String,
+        body: String,
+    },
+    Reply {
+        task_index: usize,
+        author: String,
+        body: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +246,9 @@ fn load_board(path: &Path) -> Result<Board, Box<dyn Error>> {
     if !path.exists() {
         return Ok(Board::default());
     }
+    if is_markdown_store(path) {
+        return load_markdown_board(path);
+    }
     let mut board: Board = serde_json::from_reader(File::open(path)?)?;
     if board.version != 1 {
         return Err(format!("unsupported board version: {}", board.version).into());
@@ -220,6 +258,156 @@ fn load_board(path: &Path) -> Result<Board, Box<dyn Error>> {
         board.task_order = Some(TaskOrder::NewestFirst);
     }
     Ok(board)
+}
+
+fn is_markdown_store(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+}
+
+fn load_markdown_board(path: &Path) -> Result<Board, Box<dyn Error>> {
+    let document = parse_markdown_document(fs::read_to_string(path)?);
+    let tasks = document
+        .cards
+        .iter()
+        .enumerate()
+        .map(|(index, card)| {
+            markdown_task(
+                index,
+                card.title.clone(),
+                &document.source[card.heading_end..card.end],
+            )
+        })
+        .collect();
+
+    Ok(Board {
+        channels: vec![Channel {
+            id: "general".into(),
+            name: "general".into(),
+        }],
+        tasks,
+        task_order: Some(TaskOrder::NewestFirst),
+        ..Board::default()
+    })
+}
+
+fn markdown_heading(line: &str) -> Option<&str> {
+    let line = line.trim_end_matches(['\r', '\n']);
+    let title = line.strip_prefix("# ")?.trim_end();
+    let hash_start = title.trim_end_matches('#').len();
+    let hash_count = title.len() - hash_start;
+    if hash_start == 0 {
+        return None;
+    }
+    let title = if hash_count > 0
+        && title[..hash_start]
+            .chars()
+            .last()
+            .is_some_and(|character| character.is_whitespace())
+    {
+        title[..hash_start].trim_end()
+    } else {
+        title
+    };
+    (!title.is_empty()).then_some(title)
+}
+
+fn markdown_line_ending(source: &str) -> &'static str {
+    if source.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+fn finish_markdown_card(
+    cards: &mut Vec<MarkdownCard>,
+    current: &mut Option<(usize, usize, String)>,
+    end: usize,
+) {
+    if let Some((start, heading_end, title)) = current.take() {
+        cards.push(MarkdownCard {
+            start,
+            heading_end,
+            end,
+            title,
+        });
+    }
+}
+
+fn parse_markdown_document(source: String) -> MarkdownDocument {
+    let mut cards = Vec::new();
+    let mut current = None;
+    let mut fence = None;
+    let mut offset = 0;
+
+    for line in source.split_inclusive('\n') {
+        if fence.is_none()
+            && let Some(title) = markdown_heading(line)
+        {
+            finish_markdown_card(&mut cards, &mut current, offset);
+            current = Some((offset, offset + line.len(), title.to_owned()));
+        }
+        if let Some(spec) = fence {
+            if fence_closes(line, spec) {
+                fence = None;
+            }
+        } else if let Some(spec) = fence_starts(line) {
+            fence = Some(spec);
+        }
+        offset += line.len();
+    }
+    finish_markdown_card(&mut cards, &mut current, source.len());
+
+    MarkdownDocument { source, cards }
+}
+
+fn fence_starts(line: &str) -> Option<(char, usize)> {
+    let (character, length, _) = fence_parts(line)?;
+    Some((character, length))
+}
+
+fn fence_closes(line: &str, (character, length): (char, usize)) -> bool {
+    let Some((closing_character, closing_length, suffix)) = fence_parts(line) else {
+        return false;
+    };
+    closing_character == character && closing_length >= length && suffix.trim().is_empty()
+}
+
+fn fence_parts(line: &str) -> Option<(char, usize, &str)> {
+    let indentation = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indentation > 3 {
+        return None;
+    }
+    let rest = &line[indentation..];
+    let character = rest.chars().next()?;
+    if character != '`' && character != '~' {
+        return None;
+    }
+    let length = rest.chars().take_while(|item| *item == character).count();
+    (length >= 3).then(|| {
+        let suffix = &rest[character.len_utf8() * length..];
+        if character == '`' && suffix.contains('`') {
+            return None;
+        }
+        Some((character, length, suffix))
+    })?
+}
+
+fn markdown_task(index: usize, title: String, body: &str) -> Task {
+    let lines = body.lines().collect::<Vec<_>>();
+    Task {
+        id: format!("markdown-{}", index + 1),
+        channel: "general".into(),
+        title,
+        body: lines
+            .iter()
+            .position(|line| !line.trim().is_empty())
+            .zip(lines.iter().rposition(|line| !line.trim().is_empty()))
+            .map(|(start, end)| lines[start..=end].join("\n"))
+            .unwrap_or_default(),
+        replies: Vec::new(),
+    }
 }
 
 fn marker(path: &Path) -> io::Result<Option<FileMarker>> {
@@ -267,12 +455,42 @@ impl Drop for BoardLock {
     }
 }
 
+#[cfg(test)]
 fn write_board(path: &Path, board: &Board) -> Result<(), Box<dyn Error>> {
+    if is_markdown_store(path) {
+        return Err(MARKDOWN_TARGETED_UPDATE.into());
+    }
     let bytes = serde_json::to_vec_pretty(board)?;
     write_atomically(path, &bytes, "board")
 }
 
+fn write_board_if_unchanged(
+    path: &Path,
+    board: &Board,
+    expected: Option<FileMarker>,
+) -> Result<(), Box<dyn Error>> {
+    if is_markdown_store(path) {
+        return Err(MARKDOWN_TARGETED_UPDATE.into());
+    }
+    let bytes = serde_json::to_vec_pretty(board)?;
+    write_atomically_if_unchanged(path, &bytes, "board", Some(expected))
+}
+
 fn write_atomically(path: &Path, contents: &[u8], description: &str) -> Result<(), Box<dyn Error>> {
+    write_atomically_if_unchanged(path, contents, description, None)
+}
+
+fn write_atomically_if_unchanged(
+    path: &Path,
+    contents: &[u8],
+    description: &str,
+    expected: Option<Option<FileMarker>>,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(expected) = expected
+        && marker(path)? != expected
+    {
+        return Err(EXTERNAL_CHANGE.into());
+    }
     let file_name = path
         .file_name()
         .ok_or_else(|| format!("{description} path has no file name"))?;
@@ -300,6 +518,28 @@ fn write_atomically(path: &Path, contents: &[u8], description: &str) -> Result<(
         let _ = fs::remove_file(&temp);
         return Err(error.into());
     }
+    if let Some(expected) = expected
+        && marker(path)? != expected
+    {
+        let _ = fs::remove_file(&temp);
+        return Err(EXTERNAL_CHANGE.into());
+    }
+    if expected == Some(None) {
+        match fs::hard_link(&temp, path) {
+            Ok(()) => {
+                let _ = fs::remove_file(temp);
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&temp);
+                return Err(EXTERNAL_CHANGE.into());
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temp);
+                return Err(error.into());
+            }
+        }
+    }
     if let Err(error) = fs::rename(&temp, path) {
         let _ = fs::remove_file(temp);
         return Err(error.into());
@@ -311,14 +551,33 @@ fn update_board<F>(path: &Path, update: F) -> Result<Board, Box<dyn Error>>
 where
     F: FnOnce(&mut Board) -> Result<(), Box<dyn Error>>,
 {
+    if is_markdown_store(path) {
+        return Err(MARKDOWN_TARGETED_UPDATE.into());
+    }
     let _lock = BoardLock::acquire(path)?;
+    let expected = marker(path)?;
     let mut board = load_board(path)?;
     update(&mut board)?;
-    write_board(path, &board)?;
+    write_board_if_unchanged(path, &board, expected)?;
     Ok(board)
 }
 
 fn post_task(path: &Path, channel: &str, title: &str) -> Result<(), Box<dyn Error>> {
+    if is_markdown_store(path) {
+        if channel != "general" {
+            return Err("Markdown stores support only the general channel".into());
+        }
+        let expected = marker(path)?;
+        update_markdown(
+            path,
+            Some(expected),
+            MarkdownChange::Post {
+                title: title.trim().into(),
+            },
+        )?;
+        println!("posted to #{channel}");
+        return Ok(());
+    }
     update_board(path, |board| {
         if !board.channels.iter().any(|item| item.id == channel) {
             board.channels.push(Channel {
@@ -343,6 +602,26 @@ fn post_task(path: &Path, channel: &str, title: &str) -> Result<(), Box<dyn Erro
 }
 
 fn reply_to_task(path: &Path, task_id: &str, body: &str) -> Result<(), Box<dyn Error>> {
+    if is_markdown_store(path) {
+        let expected = marker(path)?;
+        let board = load_board(path)?;
+        let task_index = board
+            .tasks
+            .iter()
+            .position(|task| task.id == task_id)
+            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        update_markdown(
+            path,
+            Some(expected),
+            MarkdownChange::Reply {
+                task_index,
+                author: author(),
+                body: body.trim().into(),
+            },
+        )?;
+        println!("replied to {task_id}");
+        return Ok(());
+    }
     update_board(path, |board| {
         let task = board
             .tasks
@@ -360,13 +639,186 @@ fn reply_to_task(path: &Path, task_id: &str, body: &str) -> Result<(), Box<dyn E
     Ok(())
 }
 
+fn markdown_task_index(task_id: &str) -> Result<usize, Box<dyn Error>> {
+    let index = task_id
+        .strip_prefix("markdown-")
+        .ok_or_else(|| format!("invalid Markdown task id: {task_id}"))?
+        .parse::<usize>()
+        .map_err(|_| format!("invalid Markdown task id: {task_id}"))?;
+    index
+        .checked_sub(1)
+        .ok_or_else(|| format!("invalid Markdown task id: {task_id}").into())
+}
+
+fn selected_markdown_task_index(task_id: Option<&str>) -> Result<usize, Box<dyn Error>> {
+    markdown_task_index(task_id.ok_or("selected task disappeared after external change")?)
+}
+
+fn markdown_card(
+    document: &MarkdownDocument,
+    task_index: usize,
+) -> Result<&MarkdownCard, Box<dyn Error>> {
+    document
+        .cards
+        .get(task_index)
+        .ok_or_else(|| format!("task not found: markdown-{}", task_index + 1).into())
+}
+
+fn markdown_change(
+    mode: EditorMode,
+    task_id: Option<&str>,
+    text: String,
+    body: String,
+) -> Result<MarkdownChange, Box<dyn Error>> {
+    match mode {
+        EditorMode::NewTask => Ok(MarkdownChange::Post { title: text }),
+        EditorMode::EditTask => Ok(MarkdownChange::Edit {
+            task_index: selected_markdown_task_index(task_id)?,
+            title: text,
+            body,
+        }),
+        EditorMode::Reply => Ok(MarkdownChange::Reply {
+            task_index: selected_markdown_task_index(task_id)?,
+            author: author(),
+            body: text,
+        }),
+    }
+}
+
+fn replace_markdown_card(
+    document: &MarkdownDocument,
+    card: &MarkdownCard,
+    replacement: &str,
+) -> String {
+    let mut result = document.source.clone();
+    result.replace_range(card.start..card.end, replacement);
+    result
+}
+
+fn update_markdown(
+    path: &Path,
+    expected: Option<Option<FileMarker>>,
+    change: MarkdownChange,
+) -> Result<Board, Box<dyn Error>> {
+    let _lock = BoardLock::acquire(path)?;
+    let before = marker(path)?;
+    if let Some(expected) = expected
+        && before != expected
+    {
+        return Err(EXTERNAL_CHANGE.into());
+    }
+    let source = match fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let document = parse_markdown_document(source);
+    let markdown = apply_markdown_change(&document, change)?;
+    write_atomically_if_unchanged(path, markdown.as_bytes(), "markdown", Some(before))?;
+    load_markdown_board(path)
+}
+
+fn apply_markdown_change(
+    document: &MarkdownDocument,
+    change: MarkdownChange,
+) -> Result<String, Box<dyn Error>> {
+    match change {
+        MarkdownChange::Post { title } => {
+            let line_ending = markdown_line_ending(&document.source);
+            if let Some(first_card) = document.cards.first() {
+                let card = format!("# {title}{line_ending}{line_ending}");
+                let mut result = document.source.clone();
+                result.insert_str(first_card.start, &card);
+                return Ok(result);
+            }
+            let card = format!("# {title}{line_ending}");
+            let blank_line = format!("{line_ending}{line_ending}");
+            let separator = if document.source.is_empty() || document.source.ends_with(&blank_line)
+            {
+                ""
+            } else if document.source.ends_with(line_ending) {
+                line_ending
+            } else {
+                &blank_line
+            };
+            Ok(format!("{}{separator}{card}", document.source))
+        }
+        MarkdownChange::Edit {
+            task_index,
+            title,
+            body,
+        } => {
+            let card = markdown_card(document, task_index)?;
+            let raw_body = &document.source[card.heading_end..card.end];
+            let leading_len = raw_body.len() - raw_body.trim_start_matches(['\r', '\n']).len();
+            let trailing_len = raw_body.len() - raw_body.trim_end_matches(['\r', '\n']).len();
+            let content_end = raw_body.len().saturating_sub(trailing_len);
+            let (leading_end, content_start) = if leading_len > content_end {
+                (raw_body.len(), raw_body.len())
+            } else {
+                (leading_len, content_end)
+            };
+            let line_ending = markdown_line_ending(&document.source[card.start..card.heading_end]);
+            let mut replacement = format!("# {title}{line_ending}");
+            replacement.push_str(&raw_body[..leading_end]);
+            if !body.is_empty() {
+                replacement.push_str(&body);
+            }
+            replacement.push_str(&raw_body[content_start..]);
+            Ok(replace_markdown_card(document, card, &replacement))
+        }
+        MarkdownChange::Reply {
+            task_index,
+            author,
+            body,
+        } => {
+            let card = markdown_card(document, task_index)?;
+            let raw_body = &document.source[card.heading_end..card.end];
+            let trailing_len = raw_body.len() - raw_body.trim_end_matches(['\r', '\n']).len();
+            let content_end = raw_body.len().saturating_sub(trailing_len);
+            let content = &raw_body[..content_end];
+            let suffix = &raw_body[content_end..];
+            let line_ending = markdown_line_ending(&document.source[card.start..card.heading_end]);
+            let separator = if content.is_empty() || content.ends_with(['\r', '\n']) {
+                ""
+            } else {
+                line_ending
+            };
+            let mut replacement = document.source[card.start..card.end].to_owned();
+            let heading_len = card.heading_end - card.start;
+            replacement.truncate(heading_len);
+            replacement.push_str(content);
+            replacement.push_str(separator);
+            for (index, line) in body.lines().enumerate() {
+                replacement.push_str("> ");
+                if index == 0 {
+                    replacement.push_str(&author);
+                    replacement.push_str(": ");
+                }
+                replacement.push_str(line);
+                replacement.push_str(line_ending);
+            }
+            replacement.push_str(suffix);
+            Ok(replace_markdown_card(document, card, &replacement))
+        }
+    }
+}
+
 fn render_markdown(path: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
     if paths_refer_to_same_file(path, output)? {
-        return Err("render output must differ from the JSON board path".into());
+        return Err("render output must differ from the board path".into());
     }
     let _lock = BoardLock::acquire(path)?;
-    let mut board = load_board(path)?;
-    import_firstmate_stamps(output, &mut board)?;
+    if is_markdown_store(path) {
+        let source = fs::read(path)?;
+        let task_count = parse_markdown_document(String::from_utf8(source.clone())?)
+            .cards
+            .len();
+        write_atomically(output, &source, "markdown")?;
+        println!("rendered {} tasks to {}", task_count, output.display());
+        return Ok(());
+    }
+    let board = load_board(path)?;
     let markdown = board_to_markdown(&board);
     write_markdown(output, &markdown)?;
     println!(
@@ -375,61 +827,6 @@ fn render_markdown(path: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
         output.display()
     );
     Ok(())
-}
-
-fn import_firstmate_stamps(path: &Path, board: &mut Board) -> Result<(), Box<dyn Error>> {
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    let mut task_id = None;
-    let mut stamp = None;
-    for line in contents.lines() {
-        if let Some(marker) = line.strip_prefix("<!-- choco: channel=") {
-            append_firstmate_stamp(board, task_id.take(), stamp.take());
-            let Some((_, id)) = marker.split_once(" id=") else {
-                continue;
-            };
-            task_id = id.strip_suffix(" -->").map(str::to_owned);
-            continue;
-        }
-        if let Some(quoted) = line.strip_prefix("> ") {
-            if let Some(firstmate) = quoted.strip_prefix("Firstmate:") {
-                append_firstmate_stamp(board, task_id.clone(), stamp.take());
-                stamp = Some(firstmate.trim_start().to_owned());
-            } else if let Some(existing) = stamp.as_mut() {
-                existing.push('\n');
-                existing.push_str(quoted);
-            }
-        } else {
-            append_firstmate_stamp(board, task_id.clone(), stamp.take());
-        }
-    }
-    append_firstmate_stamp(board, task_id, stamp);
-    Ok(())
-}
-
-fn append_firstmate_stamp(board: &mut Board, task_id: Option<String>, stamp: Option<String>) {
-    let (Some(task_id), Some(stamp)) = (task_id, stamp) else {
-        return;
-    };
-    let Some(task) = board.tasks.iter_mut().find(|task| task.id == task_id) else {
-        return;
-    };
-    let body = format!("Firstmate: {stamp}");
-    if task
-        .replies
-        .iter()
-        .any(|reply| reply.author.eq_ignore_ascii_case("firstmate") && reply.body == body)
-    {
-        return;
-    }
-    task.replies.push(Reply {
-        id: new_id(),
-        author: "firstmate".into(),
-        body,
-    });
 }
 
 fn board_to_markdown(board: &Board) -> String {
@@ -1046,7 +1443,47 @@ impl App {
         Ok(())
     }
 
+    fn submit_markdown_input(
+        &mut self,
+        mode: EditorMode,
+        content: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        let task_id = self.selected_task().map(|task| task.id.clone());
+        let (text, body) = match mode {
+            EditorMode::EditTask => {
+                let replies = self
+                    .selected_task()
+                    .map(|task| task.replies.clone())
+                    .unwrap_or_default();
+                parse_task_editor(content, &replies)?
+            }
+            EditorMode::NewTask | EditorMode::Reply => (content.trim().to_string(), String::new()),
+        };
+        if text.is_empty() {
+            return Err("editor content cannot be empty".into());
+        }
+        let change = markdown_change(mode, task_id.as_deref(), text, body)?;
+        let board = update_markdown(&self.path, Some(self.file_marker), change)?;
+        let selected_task_id = match mode {
+            EditorMode::NewTask => board.tasks.first().map(|task| task.id.clone()),
+            EditorMode::EditTask | EditorMode::Reply => task_id,
+        };
+        self.board = board;
+        self.file_marker = marker(&self.path)?;
+        self.focus = Focus::Tasks;
+        self.restore_selection(None, selected_task_id.as_deref());
+        self.status = match mode {
+            EditorMode::NewTask => "Task saved - selected below".into(),
+            EditorMode::EditTask => "Task updated".into(),
+            EditorMode::Reply => "Reply saved".into(),
+        };
+        Ok(())
+    }
+
     fn submit_input(&mut self, mode: EditorMode, content: &str) -> Result<(), Box<dyn Error>> {
+        if is_markdown_store(&self.path) {
+            return self.submit_markdown_input(mode, content);
+        }
         let preserved_replies = if mode == EditorMode::EditTask {
             self.selected_task()
                 .map(|task| task.replies.clone())
@@ -1751,7 +2188,216 @@ mod tests {
     }
 
     #[test]
-    fn markdown_render_imports_stamps_and_migrates_legacy_task_order() {
+    fn markdown_render_preserves_canonical_store_order_and_content() {
+        let stem = format!("choco-render-test-{}-{}", process::id(), new_id());
+        let board_path = env::temp_dir().join(format!("{stem}.json"));
+        let markdown_path = env::temp_dir().join(format!("{stem}.md"));
+        let board = Board {
+            tasks: vec![
+                Task {
+                    id: "newest".into(),
+                    channel: "general".into(),
+                    title: "Current newest".into(),
+                    body: "Newest context".into(),
+                    replies: Vec::new(),
+                },
+                Task {
+                    id: "middle".into(),
+                    channel: "general".into(),
+                    title: "Current middle".into(),
+                    body: "Middle context".into(),
+                    replies: Vec::new(),
+                },
+                Task {
+                    id: "oldest".into(),
+                    channel: "general".into(),
+                    title: "Current oldest".into(),
+                    body: "Oldest context".into(),
+                    replies: Vec::new(),
+                },
+            ],
+            ..Board::default()
+        };
+        write_board(&board_path, &board).unwrap();
+        let before = fs::read(&board_path).unwrap();
+
+        render_markdown(&board_path, &markdown_path).unwrap();
+
+        let rendered = fs::read_to_string(&markdown_path).unwrap();
+        let titles = rendered
+            .lines()
+            .filter(|line| line.starts_with("# "))
+            .map(|line| line[2..].to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            titles,
+            ["Current newest", "Current middle", "Current oldest"]
+        );
+        for (title, id, body) in [
+            ("Current newest", "newest", "Newest context"),
+            ("Current middle", "middle", "Middle context"),
+            ("Current oldest", "oldest", "Oldest context"),
+        ] {
+            let card = format!("# {title}\n\n<!-- choco: channel=general id={id} -->\n\n{body}\n");
+            assert!(rendered.contains(&card), "{card}\n{rendered}");
+        }
+        assert_eq!(fs::read(&board_path).unwrap(), before);
+
+        let _ = fs::remove_file(board_path);
+        let _ = fs::remove_file(markdown_path);
+    }
+
+    #[test]
+    fn markdown_store_reads_and_writes_fixture_without_losing_unknown_content() {
+        let stem = format!("choco-markdown-store-test-{}-{}", process::id(), new_id());
+        let path = env::temp_dir().join(format!("{stem}.md"));
+        let rendered_path = env::temp_dir().join(format!("{stem}-rendered.md"));
+        let fixture = "# Current newest\n\n> Firstmate: stamped <!-- zeta-todo-write:1 -->\n\n\
+captain context\n    indented code\n\n## nested heading\n\n```text\n# heading in task content\n```\n\n\
+# Current oldest #\n\nolder context\n";
+        fs::write(&path, fixture).unwrap();
+
+        render_markdown(&path, &rendered_path).unwrap();
+        assert_eq!(fs::read(&rendered_path).unwrap(), fixture.as_bytes());
+
+        let board = load_board(&path).unwrap();
+        assert_eq!(
+            board
+                .tasks
+                .iter()
+                .map(|task| task.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Current newest", "Current oldest"]
+        );
+        assert_eq!(
+            board.tasks[0].body,
+            "> Firstmate: stamped <!-- zeta-todo-write:1 -->\n\n\
+             captain context\n    indented code\n\n## nested heading\n\n\
+             ```text\n# heading in task content\n```"
+        );
+        assert_eq!(board.tasks[1].body, "older context");
+        assert_eq!(board.tasks[0].channel, "general");
+        assert_eq!(board.task_order, Some(TaskOrder::NewestFirst));
+
+        let before_channel_error = fs::read(&path).unwrap();
+        assert!(post_task(&path, "awaiting", "wrong channel").is_err());
+        assert_eq!(fs::read(&path).unwrap(), before_channel_error);
+
+        let mut app = App {
+            path: path.clone(),
+            board,
+            channel_idx: 0,
+            task_idx: 0,
+            focus: Focus::Tasks,
+            file_marker: marker(&path).unwrap(),
+            status: String::new(),
+            detail_scroll: 0,
+            search_query: None,
+            search_input: None,
+            search_selecting: false,
+            pending_g: false,
+        };
+        let screen = render_screen_sized(&app, 160, 30);
+        assert!(screen.find("Current newest").unwrap() < screen.find("Current oldest").unwrap());
+        assert!(screen.contains("captain context"), "{screen}");
+        assert!(screen.contains("nested heading"), "{screen}");
+
+        app.submit_input(EditorMode::NewTask, "Appended task")
+            .unwrap();
+        assert_eq!(app.selected_task().unwrap().title, "Appended task");
+        let after_post = fs::read_to_string(&path).unwrap();
+        assert!(after_post.starts_with("# Appended task\n\n"));
+        assert!(after_post.ends_with(fixture));
+        reply_to_task(&path, "markdown-2", "new reply").unwrap();
+        let after_write = fs::read_to_string(&path).unwrap();
+        assert!(after_write.contains("> Firstmate: stamped <!-- zeta-todo-write:1 -->"));
+        assert!(after_write.contains("## nested heading"));
+        assert!(after_write.contains("# Current oldest #\n\nolder context\n"));
+        assert!(after_write.contains("> jon: new reply"));
+        assert!(after_write.contains("# Appended task"));
+
+        let expected = marker(&path).unwrap().unwrap();
+        let edited = update_markdown(
+            &path,
+            Some(Some(expected)),
+            MarkdownChange::Edit {
+                task_index: 0,
+                title: "Renamed newest".into(),
+                body: "updated context".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(edited.tasks[0].title, "Renamed newest");
+        let after_edit = fs::read_to_string(&path).unwrap();
+        assert!(after_edit.contains("# Renamed newest"));
+        assert!(after_edit.contains("# Current oldest #\n\nolder context\n"));
+
+        let expected = marker(&path).unwrap().unwrap();
+        fs::write(&path, format!("{after_edit}\nexternal edit\n")).unwrap();
+        let unchanged = fs::read(&path).unwrap();
+        assert!(
+            update_markdown(
+                &path,
+                Some(Some(expected)),
+                MarkdownChange::Reply {
+                    task_index: 0,
+                    author: "jon".into(),
+                    body: "must not overwrite".into(),
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), unchanged);
+        let _ = fs::remove_file(path);
+
+        let missing_path = env::temp_dir().join(format!("{stem}-missing.md"));
+        post_task(&missing_path, "general", "Created from empty file").unwrap();
+        assert_eq!(
+            fs::read_to_string(&missing_path).unwrap(),
+            "# Created from empty file\n"
+        );
+        let _ = fs::remove_file(missing_path);
+        let _ = fs::remove_file(rendered_path);
+    }
+
+    #[test]
+    fn markdown_atomic_writes_never_expose_partial_contents() {
+        let stem = format!("choco-markdown-atomic-test-{}-{}", process::id(), new_id());
+        let path = env::temp_dir().join(format!("{stem}.md"));
+        let first = format!("# first\n\n{}\n", "a".repeat(256 * 1024));
+        let second = format!("# second\n\n{}\n", "b".repeat(256 * 1024));
+        fs::write(&path, &first).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let writer_barrier = Arc::clone(&barrier);
+        let writer_path = path.clone();
+        let writer_first = first.clone();
+        let writer_second = second.clone();
+        let writer = thread::spawn(move || {
+            writer_barrier.wait();
+            for index in 0..100 {
+                let contents = if index % 2 == 0 {
+                    writer_first.as_bytes()
+                } else {
+                    writer_second.as_bytes()
+                };
+                write_atomically(&writer_path, contents, "markdown").unwrap();
+            }
+        });
+
+        barrier.wait();
+        for _ in 0..5000 {
+            let contents = fs::read(&path).unwrap();
+            assert!(contents == first.as_bytes() || contents == second.as_bytes());
+        }
+        writer.join().unwrap();
+        let contents = fs::read(&path).unwrap();
+        assert!(contents == first.as_bytes() || contents == second.as_bytes());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn markdown_render_migrates_legacy_task_order_without_external_imports() {
         let stem = format!("choco-render-test-{}-{}", process::id(), new_id());
         let board_path = env::temp_dir().join(format!("{stem}.json"));
         let markdown_path = env::temp_dir().join(format!("{stem}.md"));
@@ -1788,7 +2434,7 @@ mod tests {
 
         let rendered = fs::read_to_string(&markdown_path).unwrap();
         assert!(rendered.find("# Newest").unwrap() < rendered.find("# Older").unwrap());
-        assert!(rendered.contains("> Firstmate: **08-24-2026 21:16:34.** stamped"));
+        assert!(!rendered.contains("> Firstmate: **08-24-2026 21:16:34.** stamped"));
 
         let _ = fs::remove_file(board_path);
         let _ = fs::remove_file(markdown_path);
