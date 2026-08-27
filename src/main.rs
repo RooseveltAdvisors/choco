@@ -560,6 +560,105 @@ fn exchange_atomically_if_unchanged(
     Err(EXTERNAL_CHANGE.into())
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn replace_atomically_if_unchanged_portable(
+    temp: &Path,
+    path: &Path,
+    expected: FileMarker,
+) -> Result<(), Box<dyn Error>> {
+    let file_name = path
+        .file_name()
+        .ok_or("target path has no file name")?
+        .to_string_lossy();
+    let backup = {
+        let mut created = None;
+        for attempt in 0..100 {
+            let candidate =
+                path.with_file_name(format!(".{file_name}.{}.{}.cas", process::id(), attempt));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(_) => {
+                    fs::remove_file(&candidate)?;
+                    created = Some(candidate);
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        created.ok_or("could not create a unique backup path")?
+    };
+
+    if let Err(error) = fs::rename(path, &backup) {
+        let _ = fs::remove_file(temp);
+        return if error.kind() == io::ErrorKind::NotFound {
+            Err(EXTERNAL_CHANGE.into())
+        } else {
+            Err(error.into())
+        };
+    }
+
+    let previous_marker = match marker(&backup) {
+        Ok(marker) => marker,
+        Err(error) => {
+            let restore = fs::hard_link(&backup, path);
+            let _ = fs::remove_file(&backup);
+            return match restore {
+                Ok(()) => Err(error.into()),
+                Err(restore_error) => {
+                    Err(format!("{error}; could not restore active file: {restore_error}").into())
+                }
+            };
+        }
+    };
+    if previous_marker != Some(expected) {
+        match fs::hard_link(&backup, path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                let _ = fs::remove_file(&backup);
+                let _ = fs::remove_file(temp);
+                return Err(
+                    format!("{EXTERNAL_CHANGE}; could not restore active file: {error}").into(),
+                );
+            }
+        }
+        let _ = fs::remove_file(&backup);
+        let _ = fs::remove_file(temp);
+        return Err(EXTERNAL_CHANGE.into());
+    }
+
+    match fs::hard_link(temp, path) {
+        Ok(()) => {
+            let _ = fs::remove_file(temp);
+            let _ = fs::remove_file(&backup);
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&backup);
+            let _ = fs::remove_file(temp);
+            Err(EXTERNAL_CHANGE.into())
+        }
+        Err(error) => {
+            let restore = fs::hard_link(&backup, path);
+            let _ = fs::remove_file(&backup);
+            let _ = fs::remove_file(temp);
+            match restore {
+                Ok(()) => Err(error.into()),
+                Err(restore_error) if restore_error.kind() == io::ErrorKind::AlreadyExists => {
+                    Err(error.into())
+                }
+                Err(restore_error) => {
+                    Err(format!("{error}; could not restore active file: {restore_error}").into())
+                }
+            }
+        }
+    }
+}
+
 fn write_atomically_if_unchanged(
     path: &Path,
     contents: &[u8],
@@ -627,9 +726,10 @@ fn write_atomically_if_unchanged(
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    if expected.is_some() {
-        let _ = fs::remove_file(&temp);
-        return Err("guarded atomic replacement is unsupported on this target".into());
+    if let Some(expected) = expected {
+        if let Some(expected) = expected {
+            return replace_atomically_if_unchanged_portable(&temp, path, expected);
+        }
     }
     if let Err(error) = fs::rename(&temp, path) {
         let _ = fs::remove_file(temp);
