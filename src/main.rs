@@ -612,6 +612,11 @@ fn write_atomically_if_unchanged(
             return exchange_atomically_if_unchanged(&temp, path, expected);
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    if expected.is_some() {
+        let _ = fs::remove_file(&temp);
+        return Err("atomic compare-and-swap is unsupported on this target".into());
+    }
     if let Err(error) = fs::rename(&temp, path) {
         let _ = fs::remove_file(temp);
         return Err(error.into());
@@ -842,7 +847,18 @@ fn archive_markdown(
         return Err(EXTERNAL_CHANGE.into());
     }
     write_atomically_if_unchanged(path, remaining.as_bytes(), "markdown", Some(before))?;
-    let active_after = marker(path)?;
+    let active_after = match marker(path) {
+        Ok(marker) => marker,
+        Err(error) => {
+            return match write_atomically(path, document.source.as_bytes(), "markdown rollback") {
+                Ok(()) => Err(error.into()),
+                Err(rollback_error) => Err(format!(
+                    "{error}; could not roll back active Markdown: {rollback_error}"
+                )
+                .into()),
+            };
+        }
+    };
     if let Err(error) = write_atomically_if_unchanged(
         &done_path,
         archived.as_bytes(),
