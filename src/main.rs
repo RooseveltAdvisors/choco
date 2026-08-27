@@ -551,7 +551,7 @@ fn exchange_atomically_if_unchanged(
         }
     };
     if previous_marker == Some(expected) {
-        fs::remove_file(temp)?;
+        let _ = fs::remove_file(temp);
         return Ok(());
     }
     if let Err(error) = exchange() {
@@ -625,6 +625,11 @@ fn write_atomically_if_unchanged(
         if let Some(expected) = expected {
             return exchange_atomically_if_unchanged(&temp, path, expected);
         }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    if expected.is_some() {
+        let _ = fs::remove_file(&temp);
+        return Err("guarded atomic replacement is unsupported on this target".into());
     }
     if let Err(error) = fs::rename(&temp, path) {
         let _ = fs::remove_file(temp);
