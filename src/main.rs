@@ -629,15 +629,13 @@ fn write_atomically_if_unchanged(
         }
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if let Some(expected) = expected {
-        if let Some(expected) = expected {
-            return exchange_atomically_if_unchanged(
-                &temp,
-                path,
-                expected,
-                marker_for_contents(contents),
-            );
-        }
+    if let Some(Some(expected)) = expected {
+        return exchange_atomically_if_unchanged(
+            &temp,
+            path,
+            expected,
+            marker_for_contents(contents),
+        );
     }
     if let Err(error) = fs::rename(&temp, path) {
         let _ = fs::remove_file(temp);
