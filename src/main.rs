@@ -2313,7 +2313,7 @@ captain context\n    indented code\n\n## nested heading\n\n```text\n# heading in
         assert!(after_write.contains("> Firstmate: stamped <!-- zeta-todo-write:1 -->"));
         assert!(after_write.contains("## nested heading"));
         assert!(after_write.contains("# Current oldest #\n\nolder context\n"));
-        assert!(after_write.contains("> jon: new reply"));
+        assert!(after_write.contains(&format!("> {}: new reply", author())));
         assert!(after_write.contains("# Appended task"));
 
         let expected = marker(&path).unwrap().unwrap();
