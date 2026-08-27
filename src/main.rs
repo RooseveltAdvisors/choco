@@ -12,8 +12,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 
 #[cfg(test)]
 use std::sync::{Arc, Barrier};
@@ -480,6 +484,68 @@ fn write_atomically(path: &Path, contents: &[u8], description: &str) -> Result<(
     write_atomically_if_unchanged(path, contents, description, None)
 }
 
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn renameat2(
+        olddirfd: std::os::raw::c_int,
+        oldpath: *const std::os::raw::c_char,
+        newdirfd: std::os::raw::c_int,
+        newpath: *const std::os::raw::c_char,
+        flags: std::os::raw::c_uint,
+    ) -> std::os::raw::c_int;
+}
+
+#[cfg(target_os = "linux")]
+fn exchange_atomically_if_unchanged(
+    temp: &Path,
+    path: &Path,
+    expected: FileMarker,
+) -> Result<(), Box<dyn Error>> {
+    let temp_name = CString::new(temp.as_os_str().as_bytes())?;
+    let path_name = CString::new(path.as_os_str().as_bytes())?;
+    let exchange = || {
+        let result = unsafe {
+            renameat2(
+                -100,
+                temp_name.as_ptr(),
+                -100,
+                path_name.as_ptr(),
+                2,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    };
+
+    exchange()?;
+    let previous_marker = match marker(temp) {
+        Ok(marker) => marker,
+        Err(error) => {
+            if let Err(rollback_error) = exchange() {
+                return Err(format!(
+                    "{error}; could not restore active file: {rollback_error}"
+                )
+                .into());
+            }
+            return Err(error.into());
+        }
+    };
+    if previous_marker == Some(expected) {
+        fs::remove_file(temp)?;
+        return Ok(());
+    }
+    if let Err(error) = exchange() {
+        return Err(format!(
+            "{EXTERNAL_CHANGE}; could not restore active file: {error}"
+        )
+        .into());
+    }
+    Err(EXTERNAL_CHANGE.into())
+}
+
 fn write_atomically_if_unchanged(
     path: &Path,
     contents: &[u8],
@@ -538,6 +604,12 @@ fn write_atomically_if_unchanged(
                 let _ = fs::remove_file(&temp);
                 return Err(error.into());
             }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(expected) = expected {
+        if let Some(expected) = expected {
+            return exchange_atomically_if_unchanged(&temp, path, expected);
         }
     }
     if let Err(error) = fs::rename(&temp, path) {
