@@ -12,6 +12,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::ffi::CString;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
@@ -88,7 +92,6 @@ struct Reply {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileMarker {
-    modified: SystemTime,
     len: u64,
     hash: u64,
 }
@@ -411,19 +414,22 @@ fn markdown_task(index: usize, title: String, body: &str) -> Task {
 }
 
 fn marker(path: &Path) -> io::Result<Option<FileMarker>> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
+    match fs::metadata(path) {
+        Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
-    };
+    }
     let bytes = fs::read(path)?;
+    Ok(Some(marker_for_contents(&bytes)))
+}
+
+fn marker_for_contents(contents: &[u8]) -> FileMarker {
     let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    Ok(Some(FileMarker {
-        modified: metadata.modified()?,
-        len: metadata.len(),
+    contents.hash(&mut hasher);
+    FileMarker {
+        len: contents.len() as u64,
         hash: hasher.finish(),
-    }))
+    }
 }
 
 struct BoardLock {
@@ -518,6 +524,88 @@ fn write_atomically(path: &Path, contents: &[u8], description: &str) -> Result<(
     write_atomically_if_unchanged(path, contents, description, None)
 }
 
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn renameat2(
+        olddirfd: std::os::raw::c_int,
+        oldpath: *const std::os::raw::c_char,
+        newdirfd: std::os::raw::c_int,
+        newpath: *const std::os::raw::c_char,
+        flags: std::os::raw::c_uint,
+    ) -> std::os::raw::c_int;
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn renameatx_np(
+        fromfd: std::os::raw::c_int,
+        from: *const std::os::raw::c_char,
+        tofd: std::os::raw::c_int,
+        to: *const std::os::raw::c_char,
+        flags: std::os::raw::c_uint,
+    ) -> std::os::raw::c_int;
+}
+
+#[cfg(target_os = "linux")]
+fn exchange_paths(temp: &CString, path: &CString) -> io::Result<()> {
+    let result = unsafe { renameat2(-100, temp.as_ptr(), -100, path.as_ptr(), 2) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn exchange_paths(temp: &CString, path: &CString) -> io::Result<()> {
+    let result = unsafe { renameatx_np(-2, temp.as_ptr(), -2, path.as_ptr(), 2) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn exchange_atomically_if_unchanged(
+    temp: &Path,
+    path: &Path,
+    expected: FileMarker,
+    replacement: FileMarker,
+) -> Result<(), Box<dyn Error>> {
+    let temp_name = CString::new(temp.as_os_str().as_bytes())?;
+    let path_name = CString::new(path.as_os_str().as_bytes())?;
+    let exchange = || exchange_paths(&temp_name, &path_name);
+    let restore = || -> Result<(), Box<dyn Error>> {
+        if marker(path)? != Some(replacement) {
+            return Err(EXTERNAL_CHANGE.into());
+        }
+        exchange()?;
+        Ok(())
+    };
+
+    exchange()?;
+    let previous_marker = match marker(temp) {
+        Ok(marker) => marker,
+        Err(error) => {
+            if let Err(rollback_error) = restore() {
+                return Err(
+                    format!("{error}; could not restore active file: {rollback_error}").into(),
+                );
+            }
+            return Err(error.into());
+        }
+    };
+    if previous_marker == Some(expected) {
+        let _ = fs::remove_file(temp);
+        return Ok(());
+    }
+    if let Err(error) = restore() {
+        return Err(format!("{EXTERNAL_CHANGE}; could not restore active file: {error}").into());
+    }
+    Err(EXTERNAL_CHANGE.into())
+}
+
 fn write_atomically_if_unchanged(
     path: &Path,
     contents: &[u8],
@@ -577,6 +665,15 @@ fn write_atomically_if_unchanged(
                 return Err(error.into());
             }
         }
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(Some(expected)) = expected {
+        return exchange_atomically_if_unchanged(
+            &temp,
+            path,
+            expected,
+            marker_for_contents(contents),
+        );
     }
     if let Err(error) = fs::rename(&temp, path) {
         let _ = fs::remove_file(temp);
@@ -702,6 +799,30 @@ fn markdown_card(
         .ok_or_else(|| format!("task not found: markdown-{}", task_index + 1).into())
 }
 
+fn markdown_done_path(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let stem = path
+        .file_stem()
+        .ok_or("Markdown path has no file stem")?
+        .to_string_lossy();
+    Ok(path.with_file_name(format!("{stem}-done.md")))
+}
+
+fn append_markdown_card(existing: &str, card: &str) -> String {
+    if existing.is_empty() {
+        return card.to_owned();
+    }
+    let line_ending = markdown_line_ending(existing);
+    let blank_line = format!("{line_ending}{line_ending}");
+    let separator = if existing.ends_with(&blank_line) {
+        String::new()
+    } else if existing.ends_with(line_ending) {
+        line_ending.to_owned()
+    } else {
+        blank_line
+    };
+    format!("{existing}{separator}{card}")
+}
+
 fn markdown_change(
     mode: EditorMode,
     task_id: Option<&str>,
@@ -753,6 +874,57 @@ fn update_markdown(
     let document = parse_markdown_document(source);
     let markdown = apply_markdown_change(&document, change)?;
     write_atomically_if_unchanged(path, markdown.as_bytes(), "markdown", Some(before))?;
+    load_markdown_board(path)
+}
+
+fn archive_markdown(
+    path: &Path,
+    task_index: usize,
+    expected: Option<FileMarker>,
+) -> Result<Board, Box<dyn Error>> {
+    let _lock = BoardLock::acquire(path)?;
+    let before = marker(path)?;
+    if before != expected {
+        return Err(EXTERNAL_CHANGE.into());
+    }
+    let source = fs::read_to_string(path)?;
+    let document = parse_markdown_document(source);
+    let card = markdown_card(&document, task_index)?;
+    let archived_card = document.source[card.start..card.end].to_owned();
+    let remaining = replace_markdown_card(&document, card, "");
+    let done_path = markdown_done_path(path)?;
+    let done_before = marker(&done_path)?;
+    let done_source = match fs::read_to_string(&done_path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let archived = append_markdown_card(&done_source, &archived_card);
+
+    if marker(path)? != before {
+        return Err(EXTERNAL_CHANGE.into());
+    }
+    write_atomically_if_unchanged(path, remaining.as_bytes(), "markdown", Some(before))?;
+    let active_after = marker_for_contents(remaining.as_bytes());
+    if let Err(error) = write_atomically_if_unchanged(
+        &done_path,
+        archived.as_bytes(),
+        "todo-done markdown",
+        Some(done_before),
+    ) {
+        return match write_atomically_if_unchanged(
+            path,
+            document.source.as_bytes(),
+            "markdown rollback",
+            Some(Some(active_after)),
+        ) {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(format!(
+                "{error}; could not roll back active Markdown: {rollback_error}"
+            )
+            .into()),
+        };
+    }
     load_markdown_board(path)
 }
 
@@ -1258,6 +1430,7 @@ impl App {
             KeyCode::Char('r') if self.selected_task().is_some() => {
                 self.compose_with_editor(terminal, EditorMode::Reply)?
             }
+            KeyCode::Char('a') if self.selected_task().is_some() => self.archive_selected_task()?,
             KeyCode::Char('R') => self.reload_now()?,
             _ => {}
         }
@@ -1519,6 +1692,23 @@ impl App {
         Ok(())
     }
 
+    fn archive_selected_task(&mut self) -> Result<(), Box<dyn Error>> {
+        if !is_markdown_store(&self.path) {
+            self.status = "archive requires a Markdown store".into();
+            return Ok(());
+        }
+        let Some(task_id) = self.selected_task().map(|task| task.id.clone()) else {
+            self.status = "no task selected".into();
+            return Ok(());
+        };
+        let task_index = markdown_task_index(&task_id)?;
+        self.board = archive_markdown(&self.path, task_index, self.file_marker)?;
+        self.file_marker = marker(&self.path)?;
+        self.restore_selection(None, None);
+        self.status = "Task archived".into();
+        Ok(())
+    }
+
     fn submit_input(&mut self, mode: EditorMode, content: &str) -> Result<(), Box<dyn Error>> {
         if is_markdown_store(&self.path) {
             return self.submit_markdown_input(mode, content);
@@ -1707,7 +1897,7 @@ impl App {
                         format!(" /{query}  type to narrow   Enter labels   Esc cancel")
                     }
                 } else {
-                    " hjkl move   gg/G top/bottom   / search   n/N next   Ctrl-u/d scroll   Enter edit   n new task   r reply   q quit".into()
+                    " hjkl move   gg/G top/bottom   / search   n/N next   Ctrl-u/d scroll   Enter edit   n new task   r reply   a archive   q quit".into()
                 },
                 Style::default().fg(Color::Cyan),
             )),
@@ -2284,6 +2474,146 @@ mod tests {
 
         let _ = fs::remove_file(board_path);
         let _ = fs::remove_file(markdown_path);
+    }
+
+    #[test]
+    fn markdown_editor_edit_writes_back_only_the_selected_card() {
+        let stem = format!("choco-markdown-edit-test-{}-{}", process::id(), new_id());
+        let path = env::temp_dir().join(format!("{stem}-todo.md"));
+        let fixture = "<!-- active header -->\n\n\
+# First task\n\nfirst body\n\n\
+# Second task #\n\nsecond body\n";
+        fs::write(&path, fixture).unwrap();
+        let board = load_board(&path).unwrap();
+        let mut app = App {
+            path: path.clone(),
+            board,
+            channel_idx: 0,
+            task_idx: 0,
+            focus: Focus::Tasks,
+            file_marker: marker(&path).unwrap(),
+            status: String::new(),
+            detail_scroll: 0,
+            search_query: None,
+            search_input: None,
+            search_selecting: false,
+            pending_g: false,
+        };
+
+        app.submit_input(
+            EditorMode::EditTask,
+            "Renamed first task\n\nupdated first body\n\n--- Replies (preserved on save) ---\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "<!-- active header -->\n\n\
+# Renamed first task\n\nupdated first body\n\n\
+# Second task #\n\nsecond body\n"
+        );
+        assert_eq!(
+            app.board
+                .tasks
+                .iter()
+                .map(|task| task.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Renamed first task", "Second task"]
+        );
+        assert!(!markdown_done_path(&path).unwrap().exists());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn markdown_archive_moves_one_card_and_preserves_other_content_and_order() {
+        let stem = format!("choco-markdown-archive-test-{}-{}", process::id(), new_id());
+        let path = env::temp_dir().join(format!("{stem}-todo.md"));
+        let done_path = markdown_done_path(&path).unwrap();
+        let fixture = "<!-- active header -->\n\n\
+# Keep newest\n\nnew body\n\n\
+# Archive me\n\n> Firstmate: stamp <!-- keep -->\n\narchived body\n\n\
+# Keep oldest #\n\nold body\n";
+        let done_fixture = "<!-- done notes -->\n\n# Already done\n\nold done\n";
+        fs::write(&path, fixture).unwrap();
+        fs::write(&done_path, done_fixture).unwrap();
+        let board = load_board(&path).unwrap();
+        let mut app = App {
+            path: path.clone(),
+            board,
+            channel_idx: 0,
+            task_idx: 1,
+            focus: Focus::Tasks,
+            file_marker: marker(&path).unwrap(),
+            status: String::new(),
+            detail_scroll: 0,
+            search_query: None,
+            search_input: None,
+            search_selecting: false,
+            pending_g: false,
+        };
+
+        app.archive_selected_task().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "<!-- active header -->\n\n\
+# Keep newest\n\nnew body\n\n\
+# Keep oldest #\n\nold body\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&done_path).unwrap(),
+            format!(
+                "{done_fixture}\n\
+# Archive me\n\n> Firstmate: stamp <!-- keep -->\n\narchived body\n\n"
+            )
+        );
+        assert_eq!(
+            app.board
+                .tasks
+                .iter()
+                .map(|task| task.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Keep newest", "Keep oldest"]
+        );
+        assert_eq!(app.selected_task().unwrap().title, "Keep oldest");
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(done_path);
+    }
+
+    #[test]
+    fn markdown_writeback_refuses_an_external_change_without_clobbering_it() {
+        let stem = format!("choco-markdown-stale-test-{}-{}", process::id(), new_id());
+        let path = env::temp_dir().join(format!("{stem}-todo.md"));
+        let fixture = "# Original task\n\noriginal body\n\n# Unrelated task\n\nunrelated body\n";
+        fs::write(&path, fixture).unwrap();
+        let board = load_board(&path).unwrap();
+        let mut app = App {
+            path: path.clone(),
+            board,
+            channel_idx: 0,
+            task_idx: 0,
+            focus: Focus::Tasks,
+            file_marker: marker(&path).unwrap(),
+            status: String::new(),
+            detail_scroll: 0,
+            search_query: None,
+            search_input: None,
+            search_selecting: false,
+            pending_g: false,
+        };
+        let external =
+            "# Captain changed this\n\nnewer body\n\n# Unrelated task\n\nunrelated body\n";
+        fs::write(&path, external).unwrap();
+
+        let result = app.submit_input(
+            EditorMode::EditTask,
+            "Stale edit\n\nmust not overwrite\n\n--- Replies (preserved on save) ---\n",
+        );
+
+        assert_eq!(result.unwrap_err().to_string(), EXTERNAL_CHANGE);
+        assert_eq!(fs::read_to_string(&path).unwrap(), external);
+        assert!(!markdown_done_path(&path).unwrap().exists());
+        let _ = fs::remove_file(path);
     }
 
     #[test]

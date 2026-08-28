@@ -10,9 +10,10 @@ A local `--file` path is an install choice, not product ownership.
 
 ## What it is
 
-One Markdown file is the store: each top-level `# ` heading is a task and its
-following content is the body. Choco also supports its original versioned JSON
-format for legacy boards, but it is not involved when Choco opens the canonical
+The canonical active Markdown file is the store: each top-level `# ` heading is
+a task and its following content is the body. Archived cards move to its
+sibling `-done.md` file. Choco also supports its original versioned JSON format
+for legacy boards, but it is not involved when Choco opens the canonical
 Markdown file.
 
 Agents participate by reading and editing that file, or by calling:
@@ -22,7 +23,8 @@ choco --file todo.md post --channel general "Investigate the flaky test"
 choco --file todo.md reply markdown-1 "I found the cause"
 ```
 
-The file is the contract. There is no plugin, no database, and no hosted backend.
+The Markdown files are the contract. There is no plugin, no database, and no
+hosted backend.
 
 ## What it is not
 

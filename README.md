@@ -18,9 +18,12 @@ Flash-style search. Type to filter candidates, press `Enter`, then press a
 candidate's letter to jump to it. `n`/`N` cycle matches afterward.
 `Ctrl-u`/`Ctrl-d` scroll task details, `Enter` edits the selected task, `Esc`
 cancels search, and `q` quits. Outside an active search, `n` still launches the
-editor for a new task and `r` launches it for a reply; `R` reloads.
+editor for a new task, `r` launches it for a reply, and `a` archives the
+selected task; `R` reloads.
 These controls work directly against the selected store. Markdown edits are
 targeted, atomic updates to the source file.
+If the source changes after loading, Choco refuses the write rather than
+overwriting newer content.
 The configured `$EDITOR` is used when set; otherwise nvim is launched. Writing
 the editor buffer submits the text and returns to the board; quitting without
 writing discards the draft.
@@ -40,7 +43,9 @@ The board can be plain JSON, so any harness can read or write it without a
 Choco integration. A `.md` `--file` is also supported: each top-level `# `
 heading is a task, its following content is the body, and cards are shown in
 file order. Markdown create, edit, and reply operations write back to that
-same file without a Choco-specific sync layer. The CLI is intentionally small:
+same file without a Choco-specific sync layer. The `a` archive shortcut moves a
+Markdown card to the sibling `todo-done.md` file. The CLI is intentionally
+small:
 
 ```sh
 choco --file /path/to/todo.md post --channel general "Investigate the flaky test"
